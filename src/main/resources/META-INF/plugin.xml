@@ -1,0 +1,67 @@
+<idea-plugin>
+    <id>de.pdenis.jenkspotter</id>
+    <name>JenkSpotter</name>
+    <vendor>pdenis</vendor>
+    <description><![CDATA[
+        <p><b>JenkSpotter</b> keeps an eye on your Jenkins builds while you keep working.</p>
+        <ul>
+            <li>Tracks builds you started (from the IDE or anywhere else), pinned jobs and Jenkins views</li>
+            <li>Notifications with sound when a build finishes, OS notification when the IDE is in the background</li>
+            <li>Fuzzy search over all jobs, including folders and multibranch pipelines</li>
+            <li>Trigger builds with parameters, rebuild, abort, live console log</li>
+            <li>Multiple Jenkins instances, Basic auth with API token stored in the IDE password safe</li>
+        </ul>
+        <p>Icon based on the Jenkins logo by Charles Lowell and Frontside, licensed under
+        <a href="https://creativecommons.org/licenses/by-sa/3.0/">CC BY-SA 3.0</a>, <a href="https://jenkins.io/">jenkins.io</a>.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>Git4Idea</depends>
+
+    <resource-bundle>messages.JenkSpotterBundle</resource-bundle>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationConfigurable parentId="tools"
+                                 instance="de.pdenis.jenkspotter.settings.JenkSpotterConfigurable"
+                                 id="de.pdenis.jenkspotter.settings"
+                                 displayName="JenkSpotter"/>
+
+        <toolWindow id="JenkSpotter"
+                    anchor="bottom"
+                    icon="/icons/toolWindow.svg"
+                    canCloseContents="true"
+                    factoryClass="de.pdenis.jenkspotter.ui.JenkSpotterToolWindowFactory"/>
+
+        <statusBarWidgetFactory id="JenkSpotter.StatusBar"
+                                implementation="de.pdenis.jenkspotter.ui.JenkSpotterStatusBarWidgetFactory"/>
+
+        <postStartupActivity implementation="de.pdenis.jenkspotter.ui.JenkSpotterStartup"/>
+
+        <notificationGroup id="JenkSpotter.Success" displayType="BALLOON" key="notification.group.success"/>
+        <notificationGroup id="JenkSpotter.Failure" displayType="STICKY_BALLOON" key="notification.group.failure"/>
+        <notificationGroup id="JenkSpotter.Info" displayType="BALLOON" key="notification.group.info"/>
+    </extensions>
+
+    <applicationListeners>
+        <listener class="de.pdenis.jenkspotter.notify.BuildNotifier"
+                  topic="de.pdenis.jenkspotter.core.BuildMonitorListener"/>
+    </applicationListeners>
+
+    <actions>
+        <group id="JenkSpotter.Menu" text="JenkSpotter" popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="JenkSpotter.SearchJobs"
+                    class="de.pdenis.jenkspotter.ui.SearchJobsAction"
+                    text="Search Jenkins Jobs..."
+                    description="Fuzzy search over all Jenkins jobs and trigger a build"/>
+            <action id="JenkSpotter.Refresh"
+                    class="de.pdenis.jenkspotter.ui.RefreshBuildsAction"
+                    text="Refresh Jenkins Builds"
+                    description="Poll all Jenkins servers now"/>
+            <action id="JenkSpotter.Diagnose"
+                    class="de.pdenis.jenkspotter.ui.DiagnoseAction"
+                    text="Write JenkSpotter Diagnostics to Log"
+                    description="Logs identity, own queue items and running builds per server and copies the report"/>
+        </group>
+    </actions>
+</idea-plugin>

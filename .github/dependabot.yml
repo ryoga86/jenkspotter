@@ -1,0 +1,20 @@
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# Updates target the develop branch (next version).
+version: 2
+updates:
+  - package-ecosystem: "gradle"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # The Kotlin version has to match the stdlib bundled with the oldest supported IDE
+      # (since-build 251 = 2025.1), see https://plugins.jetbrains.com/docs/intellij/using-kotlin.html
+      # Patch releases stay enabled.
+      - dependency-name: "org.jetbrains.kotlin.jvm"
+        update-types: [ "version-update:semver-major", "version-update:semver-minor" ]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"

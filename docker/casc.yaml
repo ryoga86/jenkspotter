@@ -1,0 +1,183 @@
+jenkins:
+  systemMessage: "JenkSpotter test instance - do not use for real work"
+  numExecutors: 6
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "dev"
+          name: "Dev User"
+          password: "${JENKINS_DEV_PASSWORD}"
+        - id: "other"
+          name: "Other User"
+          password: "${JENKINS_OTHER_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "deploy-token"
+              description: "Deploy token"
+              secret: "${JENKINS_DEPLOY_SECRET}"
+
+unclassified:
+  location:
+    # Deliberately different from the published port to exercise URL rebasing in the plugin.
+    url: "http://jenkins.internal:8080/"
+
+jobs:
+  - script: |
+      folder('team')
+      folder('team/deep')
+      folder('team/deep/deeper')
+      folder('team/deep/deeper/deepest')
+
+      freeStyleJob('always-green') {
+        steps { shell('echo all good; sleep 5') }
+      }
+
+      freeStyleJob('team/hello-params') {
+        parameters {
+          stringParam('GREETING', 'Hello', 'What to say')
+          booleanParam('LOUD', false, 'Shout it')
+          choiceParam('TARGET', ['dev', 'staging', 'prod'], 'Where to deploy')
+          textParam('NOTES', 'line one', 'Free text')
+        }
+        steps { shell('echo "$GREETING from $TARGET (loud=$LOUD)"; sleep 20') }
+      }
+
+      pipelineJob('team/slow-pipeline') {
+        definition {
+          cps {
+            sandbox(true)
+            script('''
+              pipeline {
+                agent any
+                stages {
+                  stage('Work') {
+                    steps {
+                      script {
+                        for (int i = 1; i <= 60; i++) { echo "step ${i}/60"; sleep 1 }
+                      }
+                    }
+                  }
+                }
+              }
+            '''.stripIndent())
+          }
+        }
+      }
+
+      pipelineJob('team/flaky') {
+        definition {
+          cps {
+            sandbox(true)
+            script('''
+              node {
+                echo "Build ${env.BUILD_NUMBER}"
+                sleep 5
+                if (env.BUILD_NUMBER.toInteger() % 3 == 0) { unstable('every third build is unstable') }
+                else if (env.BUILD_NUMBER.toInteger() % 2 == 0) { error('even builds fail') }
+              }
+            '''.stripIndent())
+          }
+        }
+      }
+
+      // Chain: pipeline -> freestyle (build step) -> freestyle (post-build trigger)
+      freeStyleJob('team/chain-last') {
+        steps { shell('echo last in chain; sleep 3') }
+      }
+      freeStyleJob('team/chain-middle') {
+        steps { shell('echo middle; sleep 3') }
+        publishers { downstream('team/chain-last', 'SUCCESS') }
+      }
+      pipelineJob('team/chain-start') {
+        definition {
+          cps {
+            sandbox(true)
+            script('''
+              node { echo 'starting chain' }
+              build job: 'team/chain-middle', wait: true
+            '''.stripIndent())
+          }
+        }
+      }
+
+      // Stages, failing tests, artifacts and an input step (approval) in one pipeline.
+      pipelineJob('team/release') {
+        definition {
+          cps {
+            sandbox(true)
+            script('''
+              pipeline {
+                // Approvals must not block an executor while they wait.
+                agent none
+                stages {
+                  stage('Build') { agent any; steps { echo 'compiling'; sleep 3 } }
+                  stage('Test') {
+                    agent any
+                    steps {
+                      writeFile file: 'TEST-r.xml', text: '<testsuite name="ReleaseSuite" tests="3" failures="1"><testcase classname="com.example.service.OrderServiceTest" name="createsOrder"/><testcase classname="com.example.service.OrderServiceTest" name="rejectsEmptyCart"><failure message="expected: rejected but was: accepted">at OrderServiceTest.rejectsEmptyCart(OrderServiceTest.java:42)</failure></testcase><testcase classname="com.example.service.PriceTest" name="rounds"/></testsuite>'
+                      junit testResults: 'TEST-r.xml'
+                    }
+                  }
+                  stage('Package') { agent any; steps { writeFile file: 'dist/app.jar', text: 'jar'; archiveArtifacts 'dist/*.jar' } }
+                  stage('Approve') { steps { input message: 'Deploy to production?', ok: 'Deploy' } }
+                  stage('Deploy') { agent any; steps { echo 'deploying'; sleep 2 } }
+                }
+              }
+            '''.stripIndent())
+          }
+        }
+      }
+
+      // All parameter types we support, including Active Choices, credentials and run parameters.
+      pipelineJob('team/all-params') {
+        parameters {
+          stringParam('NAME', 'x', 'plain string')
+          activeChoiceParam('REGION') {
+            description('Active Choices')
+            choiceType('SINGLE_SELECT')
+            groovyScript { script('return ["eu-central-1", "us-east-1:selected", "ap-south-1"]'); fallbackScript('return ["fallback"]') }
+          }
+          activeChoiceParam('FEATURES') {
+            choiceType('CHECKBOX')
+            groovyScript { script('return ["metrics", "tracing", "logging"]'); fallbackScript('return []') }
+          }
+          activeChoiceReactiveParam('ZONE') {
+            choiceType('SINGLE_SELECT')
+            groovyScript { script('return [REGION + "a", REGION + "b"]'); fallbackScript('return ["n/a"]') }
+            referencedParameter('REGION')
+          }
+          credentialsParam('TOKEN') { type('org.jenkinsci.plugins.plaincredentials.StringCredentials'); defaultValue('deploy-token') }
+          runParam('UPSTREAM', 'team/release', 'run of release', 'SUCCESSFUL')
+        }
+        // ^${...} keeps CasC from expanding it; single quotes keep Job DSL from expanding it.
+        definition { cps { sandbox(true); script('node { echo "region=^${params.REGION} features=^${params.FEATURES} zone=^${params.ZONE} upstream=^${params.UPSTREAM}" }') } }
+      }
+
+      freeStyleJob('team/deep/deeper/deepest/hidden-job') {
+        steps { shell('echo found me') }
+      }
+
+      multibranchPipelineJob('team/app') {
+        branchSources {
+          git {
+            id('app')
+            remote('file:///opt/repos/app.git')
+          }
+        }
+        triggers { periodicFolderTrigger { interval('1d') } }
+      }
+
+      listView('JenkSpotter') {
+        recurse(true)
+        jobs { regex('.*(flaky|always-green).*') }
+        columns { status(); name(); lastSuccess(); lastFailure() }
+      }

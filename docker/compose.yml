@@ -1,0 +1,14 @@
+# Local Jenkins for manual and integration testing of JenkSpotter. Not for production use.
+# Create the (git-ignored) .env with random credentials first: python3 docker/setup_env.py
+services:
+  jenkins:
+    build: .
+    container_name: jenkspotter-jenkins
+    env_file: .env
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+
+volumes:
+  jenkins_home:
