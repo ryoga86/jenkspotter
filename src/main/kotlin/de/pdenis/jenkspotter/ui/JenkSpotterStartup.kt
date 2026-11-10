@@ -39,6 +39,32 @@ class SearchJobsAction : DumbAwareAction() {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
 }
 
+/** Global shortcut: fuzzy job search popup; the chosen job is shown and selected in the tool window. */
+class GotoJobAction : DumbAwareAction() {
+    override fun actionPerformed(e: AnActionEvent) {
+        val project = e.project ?: return
+        JobSearchPopup.show(project)
+    }
+
+    override fun update(e: AnActionEvent) {
+        e.presentation.isEnabled = e.project != null
+    }
+
+    override fun getActionUpdateThread() = ActionUpdateThread.BGT
+}
+
+/** Opens the JenkSpotter tool window and selects a job in its jobs list. */
+object JobNavigator {
+    fun reveal(project: Project, serverId: String, url: String, query: String) {
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(LogConsoleManager.TOOL_WINDOW_ID) ?: return
+        toolWindow.activate {
+            val content = toolWindow.contentManager.contents.firstOrNull { it.getUserData(JobsPanel.KEY) != null } ?: return@activate
+            toolWindow.contentManager.setSelectedContent(content)
+            content.getUserData(JobsPanel.KEY)?.reveal(serverId, url, query)
+        }
+    }
+}
+
 class RefreshBuildsAction : DumbAwareAction() {
     override fun actionPerformed(e: AnActionEvent) = BuildMonitorService.getInstance().refresh()
     override fun getActionUpdateThread() = ActionUpdateThread.BGT

@@ -95,8 +95,8 @@ class JenkSpotterStatusBarWidget(private val project: Project) : CustomStatusBar
             tooltip.append("<br>").append(JenkSpotterBundle.message("status.noServers"))
         }
         snapshot.offlineServers.forEach { status ->
-            val name = JenkSpotterSettings.getInstance().server(status.serverId)?.displayName ?: status.serverId
-            tooltip.append("<br>").append(StringUtil.escapeXmlEntities(JenkSpotterBundle.message("status.offline", name, status.error ?: "")))
+            val server = JenkSpotterSettings.getInstance().server(status.serverId) ?: return@forEach
+            tooltip.append("<br>").append(StringUtil.escapeXmlEntities(ServerStatusUi.describe(server, snapshot)))
         }
         snapshot.builds.filter { it.build.building }.take(8).forEach {
             tooltip.append("<br>&#9654; ").append(StringUtil.escapeXmlEntities(it.build.displayName))

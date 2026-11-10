@@ -4,7 +4,12 @@ import de.pdenis.jenkspotter.api.BuildInfo
 import de.pdenis.jenkspotter.api.BuildResult
 import com.intellij.util.messages.Topic
 
-enum class BuildSource { OWN, TRIGGERED, PINNED, VIEW, DOWNSTREAM, BRANCH }
+enum class BuildSource {
+    OWN, TRIGGERED, PINNED, WATCHED, VIEW, DOWNSTREAM, BRANCH,
+
+    /** Seen on an executor while "all running builds" is on; dropped once it leaves the executors. */
+    RUNNING,
+}
 
 data class TrackedBuild(
     val serverId: String,
@@ -39,7 +44,34 @@ data class ServerStatus(
     val error: String?,
     val userId: String?,
     val lastUpdate: Long,
-)
+    /** False if the last poll could not reach the server at all (network, DNS, timeout). */
+    val reachable: Boolean = online,
+) {
+    val state: ConnectionState
+        get() = when {
+            online -> ConnectionState.CONNECTED
+            !reachable -> ConnectionState.OFFLINE
+            else -> ConnectionState.ERROR
+        }
+}
+
+/** What the UI shows per configured server. */
+enum class ConnectionState {
+    CONNECTING, CONNECTED,
+    /** Reachable, but authentication or a polling step failed. */
+    ERROR,
+    /** Not reachable. */
+    OFFLINE,
+    DISABLED;
+
+    companion object {
+        fun of(enabled: Boolean, status: ServerStatus?): ConnectionState = when {
+            !enabled -> DISABLED
+            status == null -> CONNECTING
+            else -> status.state
+        }
+    }
+}
 
 data class MonitorSnapshot(
     val builds: List<TrackedBuild>,

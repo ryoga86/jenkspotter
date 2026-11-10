@@ -9,6 +9,7 @@ import com.intellij.util.messages.Topic
 import de.pdenis.jenkspotter.api.JenkinsException
 import de.pdenis.jenkspotter.api.JenkinsPaths
 import de.pdenis.jenkspotter.api.JobRef
+import de.pdenis.jenkspotter.settings.JobSort
 import de.pdenis.jenkspotter.settings.ServerConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +50,11 @@ class JobIndexService(private val cs: CoroutineScope) {
     ) {
         val byUrl: Map<String, JobRef> by lazy { jobs.associateBy { it.url } }
         val byFullName: Map<String, JobRef> by lazy { jobs.associateBy { it.fullName } }
+
+        /** Full name -> jobs that trigger it after they finish. */
+        val upstream: Map<String, List<JobRef>> by lazy {
+            jobs.flatMap { job -> job.downstream.map { it to job } }.groupBy({ it.first }, { it.second })
+        }
     }
 
     private val states = ConcurrentHashMap<String, IndexState>()
@@ -80,19 +86,23 @@ class JobIndexService(private val cs: CoroutineScope) {
         }
     }
 
-    /** Searches the indexes of [serverIds]; pinned first, then score (plus recency bonus), then name. */
-    fun search(serverIds: List<String>, query: String, hidden: HiddenJobs, limit: Int = 300): List<JobHit> {
+    /** Searches the indexes of [serverIds], ordered as chosen in the jobs list (see [JobSort]). */
+    /** [only]: server id -> URLs of the jobs that may be listed (e.g. this project's jobs); null = all. */
+    fun search(serverIds: List<String>, query: String, hidden: HiddenJobs, limit: Int = 300, only: Map<String, Set<String>>? = null): List<JobHit> {
         val settings = de.pdenis.jenkspotter.settings.JenkSpotterSettings.getInstance().current
         val pinned = settings.pinnedJobs.map { "${it.serverId} ${it.url}" }.toSet()
+        val watched = settings.watchedJobs.map { "${it.serverId} ${it.url}" }.toSet()
         val recent = settings.recentJobs.withIndex().associate { (rank, key) -> key to rank }
         val candidates = serverIds.flatMap { id -> state(id).jobs.map { id to it } }.toMutableList()
-        // Pinned jobs stay visible even before the index has been loaded.
-        for (pin in settings.pinnedJobs.filter { it.serverId in serverIds }) {
+        // Pinned and watched jobs stay visible even before the index has been loaded.
+        for (pin in (settings.pinnedJobs + settings.watchedJobs).filter { it.serverId in serverIds }) {
             if (candidates.none { it.first == pin.serverId && it.second.url == pin.url }) {
                 candidates += pin.serverId to JobRef(pin.fullName.substringAfterLast('/'), pin.fullName, pin.url, "")
             }
         }
-        return rank(candidates, query, hidden, pinned, recent, limit, settings.showFolderEntries)
+        if (only != null) candidates.retainAll { (id, job) -> only[id]?.contains(job.url) == true }
+        val serverNames = settings.servers.filter { it.id in serverIds }.associate { it.id to it.displayName }
+        return rank(candidates, query, hidden, pinned, recent, limit, settings.showFolderEntries, settings.jobSort, settings.pinnedFirst, watched, serverNames)
     }
 
     /** Known jobs of a server by URL, for downstream lookups. */
@@ -108,8 +118,20 @@ class JobIndexService(private val cs: CoroutineScope) {
         if (depth >= MAX_CHAIN_DEPTH || !seen.add(job.fullName)) return emptyList()
         return job.downstream.map { name ->
             val next = jobByFullName(serverId, name)
-            ChainNode(name, next?.url, next?.let { chain(serverId, it, depth + 1, seen) }.orEmpty())
+            ChainNode(name, next?.url, next?.let { chain(serverId, it, depth + 1, seen) }.orEmpty(), next?.disabled == true)
         }
+    }
+
+    /**
+     * Where [job] sits in a chain of follow-up jobs: the longest path of upstream jobs leading to it
+     * (first entry = the job starting the chain) and how many steps the chain has below it. Null if
+     * no job triggers [job].
+     */
+    fun position(serverId: String, job: JobRef): ChainPosition? {
+        val path = upstreamPath(state(serverId), job)
+        if (path.isEmpty()) return null
+        fun depth(nodes: List<ChainNode>): Int = nodes.maxOfOrNull { 1 + depth(it.children) } ?: 0
+        return ChainPosition(path, job, depth(chain(serverId, job)))
     }
 
     fun forget(serverId: String) {
@@ -135,14 +157,16 @@ class JobIndexService(private val cs: CoroutineScope) {
             val jobs = lines.drop(1).mapNotNull { line ->
                 val p = line.split('\t')
                 when {
+                    p.size >= 8 -> JobRef(p[0], p[1], p[2], p[3], p[4].split(',').filter { it.isNotEmpty() }, p[5].toIntOrNull() ?: -1, p[6] == "disabled", p[7].split(' ').filter { it.isNotEmpty() })
+                    p.size >= 7 -> JobRef(p[0], p[1], p[2], p[3], p[4].split(',').filter { it.isNotEmpty() }, p[5].toIntOrNull() ?: -1, p[6] == "disabled")
                     p.size >= 6 -> JobRef(p[0], p[1], p[2], p[3], p[4].split(',').filter { it.isNotEmpty() }, p[5].toIntOrNull() ?: -1)
                     p.size >= 5 -> JobRef(p[0], p[1], p[2], p[3], p[4].split(',').filter { it.isNotEmpty() })
                     p.size == 4 -> JobRef(p[0], p[1], p[2], p[3])
                     else -> null
                 }
             }
-            // Indexes written by older versions lack fields (parameters); reload them in the background.
-            val outdated = jobs.any { it.parameterCount < 0 && it.isBuildable }
+            // Indexes written by older versions lack fields (parameters, disabled, repositories); reload them in the background.
+            val outdated = lines.drop(1).any { it.split('\t').size < 8 }
             IndexState(jobs, if (outdated) 0 else updatedAt)
         }.getOrElse { IndexState() }
     }
@@ -150,7 +174,7 @@ class JobIndexService(private val cs: CoroutineScope) {
     private fun save(serverId: String, jobs: List<JobRef>) {
         val f = file(serverId)
         Files.createDirectories(f.parent)
-        f.writeLines(listOf(System.currentTimeMillis().toString()) + jobs.map { "${it.name}\t${it.fullName}\t${it.url}\t${it.jobClass}\t${it.downstream.joinToString(",")}\t${it.parameterCount}" })
+        f.writeLines(listOf(System.currentTimeMillis().toString()) + jobs.map { "${it.name}\t${it.fullName}\t${it.url}\t${it.jobClass}\t${it.downstream.joinToString(",")}\t${it.parameterCount}\t${if (it.disabled) "disabled" else ""}\t${it.repos.joinToString(" ")}" })
     }
 
     companion object {
@@ -159,6 +183,17 @@ class JobIndexService(private val cs: CoroutineScope) {
         private const val PARALLEL_REQUESTS = 4
 
         fun getInstance(): JobIndexService = service()
+
+        /** Longest chain of jobs triggering [job], starting with the first one; empty if none does. */
+        fun upstreamPath(state: IndexState, job: JobRef): List<JobRef> {
+            fun longestUp(name: String, seen: Set<String>): List<JobRef> {
+                if (seen.size >= MAX_CHAIN_DEPTH) return emptyList()
+                return state.upstream[name].orEmpty().filter { it.fullName !in seen }
+                    .map { longestUp(it.fullName, seen + it.fullName) + it }
+                    .maxByOrNull { it.size }.orEmpty()
+            }
+            return longestUp(job.fullName, setOf(job.fullName))
+        }
 
         /** Breadth-first crawl; [fetch] returns jobs below a folder (null = root) plus unexplored folders. */
         suspend fun crawl(fetch: (JobRef?) -> Pair<List<JobRef>, List<JobRef>>): List<JobRef> = coroutineScope {
@@ -185,8 +220,15 @@ class JobIndexService(private val cs: CoroutineScope) {
             recent: Map<String, Int> = emptyMap(),
             limit: Int = 300,
             showFolders: Boolean = true,
+            sort: JobSort = JobSort.RELEVANCE,
+            pinnedFirst: Boolean = true,
+            watched: Set<String> = emptySet(),
+            /** Jenkins names by server id, for `@name`; with several also matched as a weak third field. */
+            serverNames: Map<String, String> = emptyMap(),
         ): List<JobHit> {
-            val tokens = JobMatcher.tokenize(query)
+            val parsed = JobMatcher.parse(query)
+            val serverAsField = serverNames.size > 1
+            val tokens = parsed.tokens
             return candidates.asSequence()
                 .filter { (_, job) -> if (job.isFolder) !hidden.isFolderHidden(job.fullName) else !hidden.isHidden(job.fullName) }
                 // Folders are only interesting when searched for explicitly.
@@ -194,20 +236,27 @@ class JobIndexService(private val cs: CoroutineScope) {
                 .mapNotNull { (serverId, job) ->
                     val name = JenkinsPaths.displayName(job.name)
                     val path = JenkinsPaths.displayName(job.fullName.substringBeforeLast('/', ""))
-                    val match = JobMatcher.match(tokens, name, path) ?: return@mapNotNull null
+                    val match = JobMatcher.match(tokens, name, path, serverNames[serverId].orEmpty(), parsed.serverTokens, serverAsField) ?: return@mapNotNull null
                     val key = "$serverId ${job.url}"
                     val recentBonus = recent[key]?.let { (MAX_RECENT_RANK - it) * RECENT_BONUS } ?: 0
                     val folderPenalty = if (job.isFolder) FOLDER_PENALTY else 0
-                    JobHit(serverId, job, name, path, match, key in pinned, match.score + recentBonus - folderPenalty)
+                    JobHit(serverId, job, name, path, match, key in pinned, match.score + recentBonus - folderPenalty, key in watched)
                 }
-                .sortedWith(
-                    compareByDescending<JobHit> { it.pinned }
-                        .thenByDescending { if (tokens.isEmpty()) -(recent["${it.serverId} ${it.job.url}"] ?: Int.MAX_VALUE) else it.score }
-                        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
-                        .thenBy { it.path },
-                )
+                .sortedWith(order(sort, pinnedFirst, !parsed.isEmpty, recent))
                 .take(limit)
                 .toList()
+        }
+
+        private fun order(sort: JobSort, pinnedFirst: Boolean, searching: Boolean, recent: Map<String, Int>): Comparator<JobHit> {
+            fun recentRank(hit: JobHit) = recent["${hit.serverId} ${hit.job.url}"] ?: Int.MAX_VALUE
+            val byName = compareBy<JobHit, String>(String.CASE_INSENSITIVE_ORDER) { it.name }.thenBy { it.path }
+            val order = when (sort) {
+                JobSort.RELEVANCE -> compareByDescending<JobHit> { if (searching) it.score else -recentRank(it) }.then(byName)
+                JobSort.NAME -> byName
+                JobSort.PATH -> compareBy<JobHit, String>(String.CASE_INSENSITIVE_ORDER) { it.path }.then(byName)
+                JobSort.RECENT -> compareBy<JobHit> { recentRank(it) }.thenByDescending { it.score }.then(byName)
+            }
+            return if (pinnedFirst) compareByDescending<JobHit> { it.pinned }.then(order) else order
         }
 
         private const val MAX_CHAIN_DEPTH = 8
@@ -226,11 +275,37 @@ data class JobHit(
     val match: JobMatcher.Result,
     val pinned: Boolean,
     val score: Int,
+    val watched: Boolean = false,
 )
 
 /** One follow-up job in a chain; [url] is null if the job is not in the index. */
-data class ChainNode(val fullName: String, val url: String?, val children: List<ChainNode>) {
+/** A job inside a follow-up chain, see [JobIndexService.position]. */
+data class ChainPosition(
+    /** Jobs before it, starting with the one that starts the chain. */
+    val path: List<JobRef>,
+    val job: JobRef,
+    /** Longest number of follow-up steps after it. */
+    val below: Int,
+) {
+    /** 1-based step of [job]; the starting job is step 1. */
+    val step: Int get() = path.size + 1
+    val length: Int get() = step + below
+
+    /** First disabled job before it: the chain stops there, so [job] is not triggered by it. */
+    val blockedBy: JobRef? get() = path.firstOrNull { it.disabled }
+}
+
+data class ChainNode(
+    val fullName: String,
+    val url: String?,
+    val children: List<ChainNode>,
+    /** Disabled in Jenkins: it is not triggered, so nothing below it runs either. */
+    val disabled: Boolean = false,
+) {
     val size: Int get() = 1 + children.sumOf { it.size }
+
+    /** Jobs of this subtree that will actually run (a disabled job cuts off everything below it). */
+    val activeSize: Int get() = if (disabled) 0 else 1 + children.sumOf { it.activeSize }
 
     /** "middle -> last" for a straight chain, "a (-> b), c" when it branches. */
     fun describe(): String {

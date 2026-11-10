@@ -11,6 +11,7 @@ import de.pdenis.jenkspotter.api.JobRef
 import de.pdenis.jenkspotter.core.BuildMonitorService
 import de.pdenis.jenkspotter.core.JobIndexListener
 import de.pdenis.jenkspotter.core.JobIndexService
+import de.pdenis.jenkspotter.core.RepoMatch
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
 import de.pdenis.jenkspotter.settings.SettingsListener
 import git4idea.repo.GitRepository
@@ -33,6 +34,18 @@ class BranchJobs(private val project: Project) : Disposable {
     @Volatile
     var branches: Set<String> = emptySet()
         private set
+
+    /** Git repositories of the project (remote URLs and root folder names), for "this project's jobs". */
+    @Volatile
+    var repos: RepoMatch = RepoMatch(emptyList(), emptyList())
+        private set
+
+    private val listeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /** Called (on a pooled thread) after the repositories or matching jobs were looked up again. */
+    fun onUpdate(listener: () -> Unit) {
+        listeners += listener
+    }
 
     private val alarm = Alarm(Alarm.ThreadToUse.POOLED_THREAD, this)
     private val key = "project:" + project.locationHash
@@ -63,6 +76,8 @@ class BranchJobs(private val project: Project) : Disposable {
             Triple(branch, names, repo.root.name)
         }
         branches = repos.map { it.first }.toSet()
+        val all = GitRepositoryManager.getInstance(project).repositories
+        this.repos = RepoMatch(all.flatMap { r -> r.remotes.flatMap { it.urls } }, all.map { it.root.name })
         val index = JobIndexService.getInstance()
         val result = mutableListOf<Match>()
         for (server in JenkSpotterSettings.getInstance().activeServers) {
@@ -80,6 +95,7 @@ class BranchJobs(private val project: Project) : Disposable {
         }
         matches = result.distinctBy { it.serverId to it.job.url }
         BuildMonitorService.getInstance().setBranchJobs(key, matches.map { it.serverId to it.job })
+        listeners.forEach { it() }
     }
 
     fun isBranchJob(serverId: String, jobUrl: String) = matches.any { it.serverId == serverId && it.job.url == jobUrl }

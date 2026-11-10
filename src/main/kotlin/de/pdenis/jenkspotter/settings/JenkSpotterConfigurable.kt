@@ -91,6 +91,7 @@ class JenkSpotterConfigurable : Configurable {
     private val failureSound = TextFieldWithBrowseButton()
     private val historyHours = JSpinner(SpinnerNumberModel(24, 1, 24 * 14, 1))
     private val buildsPerPin = JSpinner(SpinnerNumberModel(5, 1, 50, 1))
+    private val recentBuilds = JSpinner(SpinnerNumberModel(10, 1, 100, 1))
     private val wizardingMode = JBCheckBox(JenkSpotterBundle.message("settings.wizardingMode"))
 
     override fun getDisplayName() = "JenkSpotter"
@@ -173,6 +174,7 @@ class JenkSpotterConfigurable : Configurable {
             .addComponent(TitledSeparator(JenkSpotterBundle.message("settings.general")))
             .addLabeledComponent(JenkSpotterBundle.message("settings.historyHours"), historyHours)
             .addLabeledComponent(JenkSpotterBundle.message("settings.buildsPerPin"), buildsPerPin)
+            .addLabeledComponent(JenkSpotterBundle.message("settings.recentBuilds"), recentBuilds)
             .addLabeledComponent(JenkSpotterBundle.message("settings.browserUi"), browserUi)
             .addComponent(wizardingMode)
             .panel
@@ -305,6 +307,7 @@ class JenkSpotterConfigurable : Configurable {
             customFailureSound = failureSound.text.trim()
             ownHistoryHours = historyHours.value as Int
             buildsPerPinnedJob = buildsPerPin.value as Int
+            recentBuildsCount = recentBuilds.value as Int
             wizardingMode = this@JenkSpotterConfigurable.wizardingMode.isSelected
         }
     }
@@ -316,12 +319,16 @@ class JenkSpotterConfigurable : Configurable {
         // Pins, filters and recents are edited live from the tool window; keep the latest ones.
         val live = settings.current
         next.pinnedJobs = live.pinnedJobs.filter { pin -> next.servers.any { it.id == pin.serverId } }.map(PinnedJob::copy).toMutableList()
+        next.watchedJobs = live.watchedJobs.filter { w -> next.servers.any { it.id == w.serverId } }.map(PinnedJob::copy).toMutableList()
         next.filters = live.filters.map(RegexFilter::copy).toMutableList()
         next.recentJobs = live.recentJobs.filter { key -> next.servers.any { key.startsWith(it.id + " ") } }.toMutableList()
         next.rememberedParameters = live.rememberedParameters.toMutableMap(); next.rememberParameters = live.rememberParameters
         next.buildColumns = live.buildColumns; next.buildColumnWidths = live.buildColumnWidths; next.showJobPath = live.showJobPath
-        next.showFolderEntries = live.showFolderEntries; next.showDownstream = live.showDownstream
-        next.showJobServer = live.showJobServer
+        next.showFolderEntries = live.showFolderEntries; next.showDownstream = live.showDownstream; next.showChainStep = live.showChainStep; next.chainStepIcon = live.chainStepIcon; next.chainDisplay = live.chainDisplay
+        next.showBuildJobFolders = live.showBuildJobFolders; next.jobSort = live.jobSort; next.pinnedFirst = live.pinnedFirst
+        next.jobLayout = live.jobLayout; next.collapsedServers = live.collapsedServers.toMutableList()
+        next.collapsedFolders = live.collapsedFolders.toMutableList(); next.buildInfoCollapsed = live.buildInfoCollapsed
+        next.jobIcon = live.jobIcon; next.followUpIcon = live.followUpIcon; next.visibilityToggle = live.visibilityToggle; next.showAllRunning = live.showAllRunning; next.projectJobsOnly = live.projectJobsOnly; next.hiddenServers = live.hiddenServers.toMutableList(); next.hiddenStatuses = live.hiddenStatuses.toMutableList()
         val removed = settings.current.servers.map { it.id } - next.servers.map { it.id }.toSet()
         removed.forEach { id ->
             TokenStore.set(id, "", null)
@@ -360,6 +367,7 @@ class JenkSpotterConfigurable : Configurable {
         failureSound.text = working.customFailureSound
         historyHours.value = working.ownHistoryHours
         buildsPerPin.value = working.buildsPerPinnedJob
+        recentBuilds.value = working.recentBuildsCount
         wizardingMode.isSelected = working.wizardingMode
         if (serverModel.isEmpty) showServer(null) else serverList.selectedIndex = 0
         loadTokensAsync(working.servers.map { it.id })

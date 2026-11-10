@@ -1,6 +1,5 @@
 package de.pdenis.jenkspotter.ui
 
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.ui.JBPopupMenu
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
@@ -21,17 +20,20 @@ import javax.swing.JMenuItem
 import javax.swing.JPanel
 
 /**
- * Rounded chip for one filter rule. Click toggles it, the x removes it, the context menu offers
- * everything else (edit, switch mode). Red = hides matching jobs, green = shows only matching jobs;
+ * Rounded chip for one filter rule. Click toggles it, the context menu offers everything else
+ * (edit, switch mode, remove); all rules are also listed in the "Filter" menu next to the chips. Red = hides matching jobs, green = shows only matching jobs;
  * switched-off chips are drawn as a grey outline.
  */
 class FilterChip(
     private val filter: RegexFilter,
     private val onToggle: (Boolean) -> Unit,
-    private val onEdit: () -> Unit,
+    /** null for chips that are not a stored rule (this project's jobs). */
+    private val onEdit: (() -> Unit)?,
     /** null for rules whose mode cannot be switched (folder overview). */
     private val onSwitchMode: (() -> Unit)?,
-    private val onRemove: () -> Unit,
+    private val onRemove: (() -> Unit)?,
+    /** Replaces the tooltip that shows the regular expression. */
+    tooltip: String? = null,
 ) : JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(3), 0)) {
     private val valid = filter.regexOrNull() != null
     private val include = filter.mode == FilterMode.INCLUDE
@@ -39,28 +41,16 @@ class FilterChip(
 
     init {
         isOpaque = false
-        border = JBUI.Borders.empty(1, 8, 1, 4)
+        border = JBUI.Borders.empty(1, 8, 1, 8)
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         val prefix = if (include) "+" else "\u2212"
         val label = JBLabel("$prefix ${filter.label}").apply {
             foreground = if (active) UIUtil.getLabelForeground() else UIUtil.getInactiveTextColor()
         }
-        val close = JBLabel(AllIcons.Actions.Close).apply {
-            toolTipText = JenkSpotterBundle.message("filter.remove")
-            addMouseListener(object : MouseAdapter() {
-                override fun mouseEntered(e: MouseEvent) { icon = AllIcons.Actions.CloseHovered }
-                override fun mouseExited(e: MouseEvent) { icon = AllIcons.Actions.Close }
-                override fun mouseClicked(e: MouseEvent) {
-                    if (e.button == MouseEvent.BUTTON1) onRemove()
-                    e.consume()
-                }
-            })
-        }
         add(label)
-        add(close)
 
         val modeText = JenkSpotterBundle.message(if (include) "filter.mode.include" else "filter.mode.exclude")
-        toolTipText = "<html><b>${escape(filter.label)}</b><br>$modeText: <code>${escape(filter.pattern)}</code>" +
+        toolTipText = tooltip ?: "<html><b>${escape(filter.label)}</b><br>$modeText: <code>${escape(filter.pattern)}</code>" +
             (if (valid) "" else "<br><font color='red'>${JenkSpotterBundle.message("filter.invalid")}</font>") +
             "<br>${JenkSpotterBundle.message("filter.chip.help")}</html>"
         label.toolTipText = toolTipText
@@ -83,10 +73,12 @@ class FilterChip(
             if (valid) {
                 add(item(if (filter.enabled) "filter.disable" else "filter.enable") { onToggle(!filter.enabled) })
             }
-            add(item("filter.edit") { onEdit() })
+            onEdit?.let { edit -> add(item("filter.edit") { edit() }) }
             onSwitchMode?.let { switch -> add(item(if (include) "filter.switch.toExclude" else "filter.switch.toInclude") { switch() }) }
-            addSeparator()
-            add(item("filter.remove") { onRemove() })
+            onRemove?.let { remove ->
+                addSeparator()
+                add(item("filter.remove") { remove() })
+            }
         }.show(e.component, e.x, e.y)
     }
 

@@ -26,8 +26,15 @@ data class JobRef(
     val downstream: List<String> = emptyList(),
     /** Number of build parameters; -1 = unknown (index from an older version). */
     val parameterCount: Int = -1,
+    /** Switched off in Jenkins: cannot be started, and is not triggered as a follow-up either. */
+    val disabled: Boolean = false,
+    /** Git remote URLs: the job's SCM configuration and those its last build checked out. */
+    val repos: List<String> = emptyList(),
 ) {
     val isParameterized: Boolean get() = parameterCount > 0
+
+    /** A job that can be started now (not a folder, not disabled). */
+    val canBuild: Boolean get() = isBuildable && !disabled
 
     val isFolder: Boolean get() = FOLDER_CLASS_HINTS.any { jobClass.contains(it) }
     val isBuildable: Boolean get() = !isFolder

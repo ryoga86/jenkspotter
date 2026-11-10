@@ -54,6 +54,14 @@
                     class="de.pdenis.jenkspotter.ui.SearchJobsAction"
                     text="Search Jenkins Jobs..."
                     description="Fuzzy search over all Jenkins jobs and trigger a build"/>
+            <action id="JenkSpotter.GotoJob"
+                    class="de.pdenis.jenkspotter.ui.GotoJobAction"
+                    text="Go to Jenkins Job..."
+                    description="Fuzzy search over all Jenkins jobs; shows the chosen job in JenkSpotter (Shift+Enter builds it)">
+                <keyboard-shortcut keymap="$default" first-keystroke="control alt shift K"/>
+                <keyboard-shortcut keymap="Mac OS X" first-keystroke="meta alt shift J" replace-all="true"/>
+                <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt shift J" replace-all="true"/>
+            </action>
             <action id="JenkSpotter.Refresh"
                     class="de.pdenis.jenkspotter.ui.RefreshBuildsAction"
                     text="Refresh Jenkins Builds"

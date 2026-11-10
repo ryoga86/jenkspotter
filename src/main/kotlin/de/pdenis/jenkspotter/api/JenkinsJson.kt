@@ -15,7 +15,8 @@ internal object JenkinsJson {
         "_class,number,url,result,building,timestamp,duration,estimatedDuration,fullDisplayName,description," +
             "actions[causes[userId,shortDescription,upstreamUrl,upstreamBuild],parameters[name,value],totalCount,failCount,skipCount]"
     const val CAUSE_FIELDS = "actions[causes[userId,upstreamUrl,upstreamBuild]]"
-    const val JOB_FIELDS = "name,fullName,url,_class,downstreamProjects[fullName],property[parameterDefinitions[name]]"
+    const val JOB_FIELDS = "name,fullName,url,_class,color,disabled,downstreamProjects[fullName],property[parameterDefinitions[name]]," +
+        "scm[userRemoteConfigs[url]],lastBuild[actions[remoteUrls]]"
     const val JOBS_TREE = "jobs[$JOB_FIELDS,jobs[$JOB_FIELDS,jobs[$JOB_FIELDS]]]"
 
     fun JsonElement?.obj(): JsonObject? = this as? JsonObject
@@ -91,6 +92,12 @@ internal object JenkinsJson {
             jobClass = json.str("_class") ?: "",
             downstream = json["downstreamProjects"].arr()?.mapNotNull { it.obj()?.str("fullName") } ?: emptyList(),
             parameterCount = json["property"].arr()?.sumOf { p -> p.obj()?.get("parameterDefinitions").arr()?.size ?: 0 } ?: 0,
+            // "disabled" is not exported by every job type; the ball color is ("disabled", "disabled_anime").
+            disabled = json["disabled"]?.toString() == "true" || json.str("color")?.startsWith("disabled") == true,
+            repos = (
+                json["scm"].obj()?.get("userRemoteConfigs").arr()?.mapNotNull { it.obj()?.str("url") }.orEmpty() +
+                    json["lastBuild"].obj()?.get("actions").arr()?.flatMap { a -> a.obj()?.get("remoteUrls").arr()?.mapNotNull { (it as? JsonPrimitive)?.content }.orEmpty() }.orEmpty()
+                ).distinct(),
         )
     }
 

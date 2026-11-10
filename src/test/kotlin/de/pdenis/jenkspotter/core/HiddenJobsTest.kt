@@ -66,4 +66,20 @@ class HiddenJobsTest {
         assertEquals(3, node.size)
         assertEquals("a \u2192 b", ChainNode("a", null, listOf(ChainNode("x/b", null, emptyList()))).describe())
     }
+
+    @Test
+    fun `a disabled job cuts off the rest of the chain`() {
+        val last = ChainNode("team/last", null, emptyList(), disabled = true)
+        val chain = ChainNode("team/middle", null, listOf(last, ChainNode("team/other", null, emptyList())))
+        assertEquals(3, chain.size)
+        assertEquals(2, chain.activeSize)
+        assertEquals(0, ChainNode("team/off", null, listOf(ChainNode("team/below", null, emptyList())), disabled = true).activeSize)
+    }
+
+    @Test
+    fun `disabled jobs are read from the ball color`() {
+        val json = { color: String -> kotlinx.serialization.json.Json.parseToJsonElement("""{"name":"a","url":"http://j/job/a/","_class":"hudson.model.FreeStyleProject","color":"$color"}""") as kotlinx.serialization.json.JsonObject }
+        assertEquals(true, de.pdenis.jenkspotter.api.JenkinsJson.parseJob("http://j/", json("disabled"))?.disabled)
+        assertEquals(false, de.pdenis.jenkspotter.api.JenkinsJson.parseJob("http://j/", json("blue_anime"))?.disabled)
+    }
 }

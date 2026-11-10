@@ -17,7 +17,6 @@ import com.intellij.ui.ColoredTableCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
-import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.table.TableView
@@ -39,6 +38,7 @@ import de.pdenis.jenkspotter.settings.JenkSpotterConfigurable
 import de.pdenis.jenkspotter.settings.BuildColumn
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
 import de.pdenis.jenkspotter.settings.SettingsListener
+import de.pdenis.jenkspotter.settings.BuildStatusFilter
 import java.awt.BorderLayout
 import java.awt.FlowLayout
 import java.awt.event.MouseEvent
@@ -69,7 +69,7 @@ sealed class BuildRow {
 
 private enum class Scope(val key: String) {
     ALL("filter.scope.all"), MINE("filter.scope.mine"), BRANCH("filter.scope.branch"), WAITING("filter.scope.waiting"),
-    PINNED("filter.scope.pinned"), VIEWS("filter.scope.views");
+    PINNED("filter.scope.pinned"), WATCHED("filter.scope.watched"), VIEWS("filter.scope.views"), RUNNING("filter.scope.running");
     override fun toString() = JenkSpotterBundle.message(key)
 }
 
@@ -86,21 +86,24 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
     private var shownColumns: List<BuildColumn>? = null
     private val table = TableView(model)
     private val scopeCombo = ComboBox(Scope.entries.toTypedArray())
-    private val onlyFailed = JBCheckBox(JenkSpotterBundle.message("filter.onlyFailed"))
     private val search = com.intellij.ui.SearchTextField(false).apply {
         textEditor.emptyText.text = JenkSpotterBundle.message("builds.searchHint")
-        textEditor.columns = 14
+        textEditor.columns = 12
     }
 
     /** Finished builds that ended before this time are hidden by "Clear Finished" (pins/views excepted). */
     private var clearedBefore = 0L
-    private val statusLabel = JBLabel().apply { border = JBUI.Borders.empty(2, 6) }
     private val details = BuildDetailsPanel(project)
+    private val tableScroll = JBScrollPane(table)
+    private val detailsSplitter = com.intellij.ui.OnePixelSplitter(true, "JenkSpotter.BuildDetails", 0.62f)
+    private val content = JPanel(BorderLayout())
     private val ticker = Timer(1000) { if (model.items.any { it is BuildRow.Build && it.tracked.build.building }) table.repaint() }
 
     init {
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         table.setShowGrid(false)
+        table.intercellSpacing = java.awt.Dimension(0, 0)
+        table.rowHeight = JBUI.scale(20)
         table.autoResizeMode = JTable.AUTO_RESIZE_SUBSEQUENT_COLUMNS
         table.tableHeader.addMouseListener(object : java.awt.event.MouseAdapter() {
             override fun mouseReleased(e: MouseEvent) {
@@ -113,31 +116,26 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             ShowSettingsUtil.getInstance().showSettingsDialog(project, JenkSpotterConfigurable::class.java)
         }
 
-        // Filters on the left, actions (incl. settings) on the far right.
-        val filters = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply { add(scopeCombo); add(search) }
-        val right = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
-            add(onlyFailed)
-            add(createToolbar())
-        }
+        // One compact row: scope and search on the left, actions on the right.
+        val filters = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0)).apply { add(scopeCombo); add(search) }
         val north = JPanel(BorderLayout()).apply {
-            border = JBUI.Borders.empty(2, 4)
-            add(filters, BorderLayout.WEST)
-            add(right, BorderLayout.EAST)
+            border = JBUI.Borders.empty(1, 2)
+            add(filters, BorderLayout.CENTER)
+            add(createToolbar(), BorderLayout.EAST)
         }
         model.isSortable = false
         toolbar = north
-        setContent(JPanel(BorderLayout()).apply {
-            add(com.intellij.ui.OnePixelSplitter(true, "JenkSpotter.BuildDetails", 0.62f).apply {
-                firstComponent = JBScrollPane(table)
-                secondComponent = details
-            }, BorderLayout.CENTER)
-            add(statusLabel, BorderLayout.SOUTH)
-        })
+        tableScroll.border = JBUI.Borders.empty()
+        setContent(content)
+        details.onCollapsedChanged = { collapsed ->
+            JenkSpotterSettings.getInstance().updateView { buildInfoCollapsed = collapsed }
+            layoutDetails()
+        }
+        layoutDetails()
         table.selectionModel.addListSelectionListener { if (!it.valueIsAdjusting) details.show(selectedBuild()) }
 
         filter.onChange { render(BuildMonitorService.getInstance().snapshot) }
         scopeCombo.addActionListener { render(BuildMonitorService.getInstance().snapshot) }
-        onlyFailed.addActionListener { render(BuildMonitorService.getInstance().snapshot) }
         search.addDocumentListener(object : com.intellij.ui.DocumentAdapter() {
             override fun textChanged(e: javax.swing.event.DocumentEvent) = render(BuildMonitorService.getInstance().snapshot)
         })
@@ -185,6 +183,9 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
                 selectedBuild()?.let { BuildActions.trigger(project, it.serverId, it.build.jobUrl, it.build.jobFullName, null) }
             })
             addSeparator()
+            add(jobToggle("action.pin", "action.unpin", JenkSpotterIcons.Pinned, JenkSpotterSettings::isPinned, JenkSpotterSettings::togglePin))
+            add(jobToggle("action.watch", "action.unwatch", JenkSpotterIcons.Watched, JenkSpotterSettings::isWatched, JenkSpotterSettings::toggleWatch))
+            addSeparator()
             add(FilterActions.group(project) {
                 when (val row = table.selectedObject) {
                     is BuildRow.Build -> row.tracked.build.jobFullName
@@ -213,7 +214,7 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         val selectedKey = table.selectedObject?.key
         val hidden = filter.hidden()
         val scope = scopeCombo.selectedItem as? Scope ?: Scope.ALL
-        val failedOnly = onlyFailed.isSelected
+        val hiddenStatuses = statusFilterHidden()
 
         val builds = snapshot.builds.asSequence()
             .filter { filter.includes(it.serverId) && !hidden.isHidden(it.build.jobFullName) }
@@ -224,23 +225,41 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
                     Scope.BRANCH -> isCurrentBranch(it)
                     Scope.WAITING -> it.key in snapshot.waitingInput
                     Scope.PINNED -> BuildSource.PINNED in it.sources
+                    Scope.WATCHED -> BuildSource.WATCHED in it.sources
                     Scope.VIEWS -> BuildSource.VIEW in it.sources
+                    Scope.RUNNING -> it.build.building
                 }
             }
-            .filter { !failedOnly || it.build.result in setOf(BuildResult.FAILURE, BuildResult.UNSTABLE) }
-            .filter { it.build.building || it.sources.any { s -> s == BuildSource.PINNED || s == BuildSource.VIEW } ||
+            .filter { statusOf(it.build) !in hiddenStatuses }
+            .filter { it.build.building || it.sources.any { s -> s == BuildSource.PINNED || s == BuildSource.WATCHED || s == BuildSource.VIEW } ||
                 it.build.timestamp + it.build.durationMillis >= clearedBefore }
             .filter { matchesSearch(it.build.jobFullName, it.build.number.toString(), it.build.parameters.joinToString(" ") { p -> "${p.name}=${p.value}" }, it.build.description.orEmpty()) }
             .toList()
         val queued = snapshot.queued.asSequence()
-            .filter { filter.includes(it.serverId) && !hidden.isHidden(it.jobFullName) && !failedOnly && scope in setOf(Scope.ALL, Scope.MINE) }
+            .filter { filter.includes(it.serverId) && !hidden.isHidden(it.jobFullName) && BuildStatusFilter.QUEUED !in hiddenStatuses && scope in setOf(Scope.ALL, Scope.MINE) }
             .filter { matchesSearch(it.jobFullName) }
             .map { BuildRow.Queued(it) }
         model.items = queued.toList() + withChildren(builds)
         model.items.indexOfFirst { it.key == selectedKey }.takeIf { it >= 0 }?.let {
             table.selectionModel.setSelectionInterval(it, it)
         }
-        statusLabel.text = statusText(snapshot)
+    }
+
+    /** Open build info: splitter below the table; closed: just its title row under the table. */
+    private fun layoutDetails() {
+        content.removeAll()
+        if (details.collapsed) {
+            detailsSplitter.firstComponent = null
+            detailsSplitter.secondComponent = null
+            content.add(tableScroll, BorderLayout.CENTER)
+            content.add(details, BorderLayout.SOUTH)
+        } else {
+            detailsSplitter.firstComponent = tableScroll
+            detailsSplitter.secondComponent = details
+            content.add(detailsSplitter, BorderLayout.CENTER)
+        }
+        content.revalidate()
+        content.repaint()
     }
 
     /** Built from the checked-out branch: its multibranch job, or a parameter whose value is the branch. */
@@ -269,7 +288,8 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         val result = mutableListOf<BuildRow>()
         val index = de.pdenis.jenkspotter.core.JobIndexService.getInstance()
         fun addExpected(serverId: String, parentKey: String, nodes: List<de.pdenis.jenkspotter.core.ChainNode>, depth: Int) {
-            for (node in nodes) {
+            // A disabled job is not triggered, and nothing below it is either.
+            for (node in nodes.filter { !it.disabled }) {
                 result += BuildRow.Expected(serverId, parentKey, node.fullName, node.url, depth)
                 addExpected(serverId, "$parentKey -> ${node.fullName}", node.children, depth + 1)
             }
@@ -280,7 +300,7 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             val own = children[build.key].orEmpty().sortedBy { it.build.timestamp }
             own.forEach { add(it, depth + 1) }
             // While a build runs, show the follow-ups its configuration will trigger but that did not start yet.
-            if (build.build.building) {
+            if (build.build.building && BuildStatusFilter.QUEUED !in statusFilterHidden()) {
                 val job = index.jobByUrl(build.serverId, build.build.jobUrl) ?: return
                 val started = own.map { it.build.jobFullName }.toSet()
                 addExpected(build.serverId, build.key, index.chain(build.serverId, job).filter { it.fullName !in started }, depth + 1)
@@ -288,19 +308,6 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         }
         builds.filter { it.parentKey !in keys }.forEach { add(it, 0) }
         return result
-    }
-
-    private fun statusText(snapshot: MonitorSnapshot): String {
-        val settings = JenkSpotterSettings.getInstance()
-        if (settings.activeServers.isEmpty()) return JenkSpotterBundle.message("status.noServers")
-        return settings.activeServers.filter { filter.includes(it.id) }.joinToString("   ") { server ->
-            val status = snapshot.servers[server.id]
-            when {
-                status == null -> JenkSpotterBundle.message("status.connecting", server.displayName)
-                !status.online -> JenkSpotterBundle.message("status.offline", server.displayName, status.error ?: "")
-                else -> JenkSpotterBundle.message("status.online", server.displayName, status.userId ?: "?")
-            }
-        }
     }
 
     private fun selectedBuild(): TrackedBuild? = (table.selectedObject as? BuildRow.Build)?.tracked
@@ -331,13 +338,85 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             }
         })
         addSeparator()
+        add(statusFilterMenu())
         add(action("action.clearFinished", AllIcons.Actions.GC, enabled = { model.items.any { it is BuildRow.Build && !it.tracked.build.building } }) {
             clearedBefore = System.currentTimeMillis()
             render(BuildMonitorService.getInstance().snapshot)
         })
+        // Refresh and settings are in the tool window title.
         add(columnsMenu())
-        add(JenkSpotterMainPanel.refreshAction())
-        add(JenkSpotterMainPanel.configureAction(project))
+    }
+
+    private fun statusFilterHidden(): Set<BuildStatusFilter> =
+        JenkSpotterSettings.getInstance().current.hiddenStatuses.mapNotNull { n -> BuildStatusFilter.entries.firstOrNull { it.name == n } }.toSet()
+
+    private fun setHiddenStatuses(hidden: Set<BuildStatusFilter>) =
+        JenkSpotterSettings.getInstance().updateView { hiddenStatuses = hidden.map { it.name }.toMutableList() }
+
+    /** Filter icon with one check box per build status; the icon gets a dot while something is hidden. */
+    private fun statusFilterMenu() = object : DefaultActionGroup({ JenkSpotterBundle.message("builds.statusFilter") }, true) {
+        init {
+            templatePresentation.icon = AllIcons.General.Filter
+            add(object : DumbAwareAction({ JenkSpotterBundle.message("builds.statusFilter.all") }) {
+                override fun actionPerformed(e: AnActionEvent) = setHiddenStatuses(emptySet())
+                override fun update(e: AnActionEvent) {
+                    e.presentation.isEnabled = statusFilterHidden().isNotEmpty()
+                }
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
+            })
+            add(object : DumbAwareAction({ JenkSpotterBundle.message("builds.statusFilter.onlyFailed") }) {
+                override fun actionPerformed(e: AnActionEvent) =
+                    setHiddenStatuses(BuildStatusFilter.entries.toSet() - BuildStatusFilter.FAILURE - BuildStatusFilter.UNSTABLE)
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
+            })
+            addSeparator()
+            for (status in BuildStatusFilter.entries) {
+                add(object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message(status.key), null, statusIcon(status)) {
+                    override fun isSelected(e: AnActionEvent) = status !in statusFilterHidden()
+                    override fun setSelected(e: AnActionEvent, state: Boolean) {
+                        setHiddenStatuses(if (state) statusFilterHidden() - status else statusFilterHidden() + status)
+                    }
+                    override fun getActionUpdateThread() = ActionUpdateThread.EDT
+                })
+            }
+        }
+
+        override fun update(e: AnActionEvent) {
+            val hidden = statusFilterHidden()
+            e.presentation.icon = com.intellij.ui.BadgeIconSupplier(AllIcons.General.Filter).getLiveIndicatorIcon(hidden.isNotEmpty())
+            e.presentation.text = JenkSpotterBundle.message("builds.statusFilter") +
+                if (hidden.isEmpty()) "" else " (" + BuildStatusFilter.entries.filter { it !in hidden }.joinToString { JenkSpotterBundle.message(it.key) } + ")"
+        }
+
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+    }
+
+    private fun statusIcon(status: BuildStatusFilter): javax.swing.Icon = when (status) {
+        BuildStatusFilter.RUNNING -> AllIcons.Actions.Execute
+        BuildStatusFilter.SUCCESS -> JenkSpotterIcons.forResult(BuildResult.SUCCESS)
+        BuildStatusFilter.FAILURE -> JenkSpotterIcons.forResult(BuildResult.FAILURE)
+        BuildStatusFilter.UNSTABLE -> JenkSpotterIcons.forResult(BuildResult.UNSTABLE)
+        BuildStatusFilter.ABORTED -> JenkSpotterIcons.forResult(BuildResult.ABORTED)
+        BuildStatusFilter.QUEUED -> JenkSpotterIcons.Queued
+    }
+
+    /** Pin / watch the job of the selected build; the text names what a click will do. */
+    private fun jobToggle(
+        onKey: String, offKey: String, icon: javax.swing.Icon,
+        isOn: JenkSpotterSettings.(String, String) -> Boolean,
+        toggle: JenkSpotterSettings.(String, String, String) -> Unit,
+    ) = object : DumbAwareAction({ JenkSpotterBundle.message(onKey) }, icon) {
+        override fun actionPerformed(e: AnActionEvent) {
+            val build = selectedBuild() ?: return
+            JenkSpotterSettings.getInstance().toggle(build.serverId, build.build.jobFullName, build.build.jobUrl)
+        }
+        override fun update(e: AnActionEvent) {
+            val build = selectedBuild()
+            e.presentation.isEnabled = build != null
+            val on = build != null && JenkSpotterSettings.getInstance().isOn(build.serverId, build.build.jobUrl)
+            e.presentation.text = JenkSpotterBundle.message(if (on) offKey else onKey)
+        }
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
     private fun action(key: String, icon: javax.swing.Icon, enabled: () -> Boolean, perform: () -> Unit) =
@@ -449,13 +528,7 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             override fun valueOf(item: BuildRow): String = when (item) {
                 is BuildRow.Queued -> JenkSpotterBundle.message("source.TRIGGERED")
                 is BuildRow.Expected -> JenkSpotterBundle.message("source.DOWNSTREAM")
-                is BuildRow.Build -> buildList {
-                    if (item.tracked.mine) add(JenkSpotterBundle.message("source.MINE"))
-                    if (BuildSource.PINNED in item.tracked.sources) add(JenkSpotterBundle.message("source.PINNED"))
-                    if (BuildSource.VIEW in item.tracked.sources) add(JenkSpotterBundle.message("source.VIEW"))
-                    if (BuildSource.DOWNSTREAM in item.tracked.sources) add(JenkSpotterBundle.message("source.DOWNSTREAM"))
-                    if (isEmpty()) addAll(item.tracked.build.causeDescriptions.take(1))
-                }.joinToString(", ")
+                is BuildRow.Build -> sourceText(item.tracked)
             }
         }
         BuildColumn.SERVER -> object : FixedColumn(column) {
@@ -489,7 +562,22 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         JenkSpotterSettings.getInstance().updateView { buildColumns = BuildColumn.format(order) }
     }
 
-    private fun columnsMenu() = ViewOptions.menu("builds.columns", BuildColumn.entries.map { column ->
+    private fun columnsMenu() = ViewOptions.menu("jobs.show", listOf(
+        object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message("builds.show.allRunning")) {
+            override fun isSelected(e: AnActionEvent) = JenkSpotterSettings.getInstance().current.showAllRunning
+            override fun setSelected(e: AnActionEvent, state: Boolean) {
+                JenkSpotterSettings.getInstance().updateView { showAllRunning = state }
+                BuildMonitorService.getInstance().refresh()
+            }
+            override fun update(e: AnActionEvent) {
+                super.update(e)
+                e.presentation.description = JenkSpotterBundle.message("builds.show.allRunning.description")
+            }
+            override fun getActionUpdateThread() = ActionUpdateThread.EDT
+        },
+        ViewOptions.toggle("builds.show.folders", { showBuildJobFolders }) { showBuildJobFolders = it },
+        com.intellij.openapi.actionSystem.Separator.create(JenkSpotterBundle.message("builds.columns")),
+    ) + BuildColumn.entries.map { column ->
         ViewOptions.toggle(column.key, { column in BuildColumn.parse(buildColumns) }) { visible ->
             val current = BuildColumn.parse(buildColumns)
             buildColumns = BuildColumn.format(if (visible) current + column else current - column)
@@ -548,28 +636,31 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
     private val jobRendererInstance = object : ColoredTableCellRenderer() {
         override fun customizeCellRenderer(table: JTable, value: Any?, selected: Boolean, hasFocus: Boolean, row: Int, column: Int) {
             val item = value as? BuildRow ?: return
+            // Last known state of a Jenkins that cannot be polled right now: greyed, see [staleNote].
+            val stale = staleSince(item.serverId)
+            val plain = if (stale != null) SimpleTextAttributes.GRAYED_ATTRIBUTES else SimpleTextAttributes.REGULAR_ATTRIBUTES
             when (item) {
                 is BuildRow.Expected -> {
-                    icon = JenkSpotterIcons.Expected
-                    ipad = JBUI.insetsLeft(item.depth * 16)
-                    append("\u21B3 ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    append(JenkinsPaths.displayName(item.jobFullName), SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)
+                    icon = followUp(item.depth, JenkSpotterIcons.Expected)
+                    ipad = JBUI.emptyInsets()
+                    append(jobLabel(item.serverId, item.jobFullName), SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)
                 }
                 is BuildRow.Queued -> {
                     icon = JenkSpotterIcons.Queued
                     ipad = JBUI.emptyInsets()
-                    append(JenkinsPaths.displayName(item.trigger.jobFullName))
+                    append(jobLabel(item.serverId, item.trigger.jobFullName), plain)
                 }
                 is BuildRow.Build -> {
-                    icon = if (item.tracked.key in BuildMonitorService.getInstance().snapshot.waitingInput) AllIcons.General.BalloonWarning
-                    else JenkSpotterIcons.forResult(item.tracked.build.result)
-                    if (item.depth > 0) {
-                        ipad = JBUI.insetsLeft(item.depth * 16)
-                        append("\u21B3 ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    } else {
-                        ipad = JBUI.emptyInsets()
+                    val result = item.tracked.build.result
+                    val base = when {
+                        item.tracked.key in BuildMonitorService.getInstance().snapshot.waitingInput -> AllIcons.General.BalloonWarning
+                        // A running build of an unreachable Jenkins may have finished long ago.
+                        stale != null && item.tracked.build.building -> AllIcons.RunConfigurations.TestUnknown
+                        else -> JenkSpotterIcons.forResult(result)
                     }
-                    append(JenkinsPaths.displayName(item.tracked.build.jobFullName))
+                    icon = followUp(item.depth, base)
+                    ipad = JBUI.emptyInsets()
+                    append(jobLabel(item.serverId, item.tracked.build.jobFullName), plain)
                     append("  #${item.tracked.build.number}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
                     toolTipText = buildTooltip(item.tracked)
                 }
@@ -582,11 +673,28 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         }
     }
 
+    /** Follow-up builds: a small tree connector in front of the result icon, indented per level. */
+    private fun followUp(depth: Int, icon: javax.swing.Icon): javax.swing.Icon =
+        if (depth <= 0) icon else com.intellij.ui.RowIcon(TreeBranchIcon(depth), icon)
+
+    /** Time of the last successful poll if the build's Jenkins is offline or failing, else null. */
+    private fun staleSince(serverId: String): Long? {
+        val status = BuildMonitorService.getInstance().snapshot.servers[serverId] ?: return null
+        return if (status.online) null else status.lastUpdate
+    }
+
     private fun buildTooltip(tracked: TrackedBuild): String {
         val e = StringUtil::escapeXmlEntities
         val b = tracked.build
         val out = StringBuilder("<html><b>").append(e(b.displayName)).append("</b> - ")
             .append(JenkSpotterBundle.message("result.${b.result.name}"))
+        staleSince(tracked.serverId)?.let { since ->
+            val server = JenkSpotterSettings.getInstance().server(tracked.serverId)?.displayName.orEmpty()
+            val time = if (since > 0) DateFormatUtil.formatPrettyDateTime(since) else "-"
+            out.append("<br><font color='#").append(com.intellij.ui.ColorUtil.toHex(com.intellij.ui.JBColor.RED)).append("'>")
+                .append(e(JenkSpotterBundle.message("builds.stale", server, time))).append("</font>")
+        }
+        if (!JenkSpotterSettings.getInstance().current.showBuildJobFolders) out.append("<br>").append(e(JenkinsPaths.displayName(b.jobFullName)))
         out.append("<br>").append(JenkSpotterBundle.message("builds.tooltip.started", DateFormatUtil.formatDateTime(b.timestamp)))
         b.causeDescriptions.distinct().forEach { out.append("<br>").append(e(it)) }
         b.tests?.let { t ->
@@ -601,18 +709,90 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
     }
 
     companion object {
+        /** Which entry of the status filter a build belongs to. */
+        fun statusOf(build: de.pdenis.jenkspotter.api.BuildInfo): BuildStatusFilter = when {
+            build.building -> BuildStatusFilter.RUNNING
+            build.result == BuildResult.SUCCESS -> BuildStatusFilter.SUCCESS
+            build.result == BuildResult.FAILURE -> BuildStatusFilter.FAILURE
+            build.result == BuildResult.UNSTABLE -> BuildStatusFilter.UNSTABLE
+            else -> BuildStatusFilter.ABORTED
+        }
+
         private fun jobName(row: BuildRow) = when (row) {
             is BuildRow.Queued -> row.trigger.jobFullName
             is BuildRow.Expected -> row.jobFullName
             is BuildRow.Build -> row.tracked.build.jobFullName
         }
 
+        /** Job name as shown in the table: with or without its folder path (see the "Show" menu). */
+        fun jobLabel(serverId: String, fullName: String): String =
+            if (JenkSpotterSettings.getInstance().current.showBuildJobFolders) JenkinsPaths.displayName(fullName) else shortName(serverId, fullName)
+
+        /**
+         * Job name without folders. Branch jobs keep their multibranch pipeline in front, since a
+         * branch name alone ("main") does not say which repository it belongs to.
+         */
+        fun shortName(serverId: String, fullName: String): String {
+            val parts = fullName.split('/')
+            if (parts.size < 2) return JenkinsPaths.displayName(fullName)
+            val parent = de.pdenis.jenkspotter.core.JobIndexService.getInstance().jobByFullName(serverId, parts.dropLast(1).joinToString("/"))
+            val keep = if (parent?.jobClass?.contains("MultiBranch") == true) 2 else 1
+            return JenkinsPaths.displayName(parts.takeLast(keep).joinToString("/"))
+        }
+
+        /** Why a build is listed: mine, pinned, watched, view, follow-up, or else its first cause. */
+        fun sourceText(tracked: TrackedBuild): String = buildList {
+            if (tracked.mine) add(JenkSpotterBundle.message("source.MINE"))
+            if (BuildSource.PINNED in tracked.sources) add(JenkSpotterBundle.message("source.PINNED"))
+            if (BuildSource.WATCHED in tracked.sources) add(JenkSpotterBundle.message("source.WATCHED"))
+            if (BuildSource.VIEW in tracked.sources) add(JenkSpotterBundle.message("source.VIEW"))
+            if (BuildSource.DOWNSTREAM in tracked.sources) add(JenkSpotterBundle.message("source.DOWNSTREAM"))
+            if (isEmpty()) addAll(tracked.build.causeDescriptions.take(1))
+        }.joinToString(", ")
+
         fun durationText(tracked: TrackedBuild): String {
             val build = tracked.build
-            if (!build.building) return StringUtil.formatDuration(build.durationMillis)
+            if (!build.building) return formatDuration(build.durationMillis)
             val elapsed = (System.currentTimeMillis() - build.timestamp).coerceAtLeast(0)
-            val estimate = build.estimatedDurationMillis.takeIf { it > 0 }?.let { " / ~" + StringUtil.formatDuration(it) }.orEmpty()
-            return StringUtil.formatDuration(elapsed) + estimate
+            val estimate = build.estimatedDurationMillis.takeIf { it > 0 }?.let { " / ~" + formatDuration(it) }.orEmpty()
+            return formatDuration(elapsed) + estimate
         }
+
+        /** "1 h 5 m", "12 m 30 s", "45 s": whole seconds, no milliseconds. */
+        fun formatDuration(millis: Long): String {
+            val seconds = (millis + 500) / 1000
+            val h = seconds / 3600
+            val m = seconds % 3600 / 60
+            val s = seconds % 60
+            return when {
+                h > 0 -> if (m > 0) "$h h $m m" else "$h h"
+                m > 0 -> if (s > 0) "$m m $s s" else "$m m"
+                else -> "$s s"
+            }
+        }
+    }
+}
+
+/** Tree connector ("└─") for follow-up builds; one indent step per level, the line in the last one. */
+private class TreeBranchIcon(private val depth: Int) : javax.swing.Icon {
+    override fun paintIcon(c: java.awt.Component?, g: java.awt.Graphics, x: Int, y: Int) {
+        val g2 = g.create() as java.awt.Graphics2D
+        try {
+            g2.color = com.intellij.util.ui.UIUtil.getContextHelpForeground()
+            val step = JBUI.scale(STEP)
+            val cx = x + (depth - 1) * step + step / 2
+            val cy = y + iconHeight / 2
+            g2.drawLine(cx, y, cx, cy)
+            g2.drawLine(cx, cy, x + depth * step - JBUI.scale(1), cy)
+        } finally {
+            g2.dispose()
+        }
+    }
+
+    override fun getIconWidth() = JBUI.scale(STEP) * depth
+    override fun getIconHeight() = JBUI.scale(16)
+
+    companion object {
+        private const val STEP = 12
     }
 }

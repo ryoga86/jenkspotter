@@ -56,6 +56,9 @@ class BuildMonitorService(private val cs: CoroutineScope) {
     private var knownPins: List<de.pdenis.jenkspotter.settings.PinnedJob> = emptyList()
 
     @Volatile
+    private var knownWatched: List<de.pdenis.jenkspotter.settings.PinnedJob> = emptyList()
+
+    @Volatile
     var snapshot: MonitorSnapshot = MonitorSnapshot.EMPTY
         private set
 
@@ -67,8 +70,9 @@ class BuildMonitorService(private val cs: CoroutineScope) {
                 val current = JenkSpotterSettings.getInstance().current
                 when {
                     current.servers.filter { it.enabled } != runningServers -> restart()
-                    current.pinnedJobs != knownPins -> {
+                    current.pinnedJobs != knownPins || current.watchedJobs != knownWatched -> {
                         knownPins = current.pinnedJobs.map { it.copy() }
+                        knownWatched = current.watchedJobs.map { it.copy() }
                         refresh()
                     }
                 }
@@ -115,6 +119,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         val servers = JenkSpotterSettings.getInstance().activeServers.map(ServerConfig::copy)
         runningServers = servers
         knownPins = JenkSpotterSettings.getInstance().current.pinnedJobs.map { it.copy() }
+        knownWatched = JenkSpotterSettings.getInstance().current.watchedJobs.map { it.copy() }
         loops.values.forEach { it.cancel() }
         loops.clear()
         wakeups.clear()
@@ -138,6 +143,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         while (cs.isActive) {
             val server = JenkSpotterSettings.getInstance().server(serverId)?.takeIf { it.enabled } ?: return
             val errors = mutableListOf<String>()
+            var unreachable = false
             try {
                 val client = JenkinsConnections.getInstance().client(server)
                     ?: throw JenkinsException("No API token configured")
@@ -156,6 +162,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
             } catch (e: Exception) {
                 if (e !is JenkinsException) thisLogger().warn("Polling ${server.url} failed", e)
                 if ((e as? JenkinsException)?.statusCode == 401) userId = null
+                unreachable = e.cause is java.io.IOException
                 errors += e.message ?: e.javaClass.simpleName
             }
             val error = errors.firstOrNull()
@@ -165,6 +172,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
             statuses[serverId] = ServerStatus(
                 serverId, error == null, error, userId,
                 if (error == null) System.currentTimeMillis() else previous?.lastUpdate ?: 0,
+                reachable = !unreachable,
             )
             publish()
 
@@ -177,7 +185,8 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         try {
             block()
         } catch (e: JenkinsException) {
-            if (e.statusCode == 401) throw e
+            // Unauthorized or unreachable: the whole poll failed, not just this step.
+            if (e.statusCode == 401 || e.cause is java.io.IOException) throw e
             errors += "$name: ${e.message}"
         }
     }
@@ -228,7 +237,35 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         // 3. Running builds: a compact executor listing (URL + causes) decides what is of interest;
         //    full details are only fetched once per newly discovered build.
         val seen = HashSet<String>()
-        if (server.trackOwnBuilds && userId != null) {
+        val showAll = JenkSpotterSettings.getInstance().current.showAllRunning
+        if (showAll) {
+            // One listing with full build fields: no request per build, also for the uninteresting ones.
+            step("executors", errors) {
+                var pending = client.runningBuilds()
+                val urls = pending.map { it.url }.toSet()
+                if (server.trackOwnBuilds && userId != null) {
+                    repeat(MAX_CHAIN_DEPTH) {
+                        val next = pending.filterNot { interesting(it.causeUserIds.toSet(), it.upstream) }
+                        for (build in pending - next.toSet()) {
+                            seen += build.url
+                            upsertDiscovered(server.id, build, BuildSource.OWN, userId)?.let(finished::add)
+                        }
+                        if (next.size == pending.size) return@repeat
+                        pending = next
+                    }
+                }
+                synchronized(lock) {
+                    for (build in pending.filter { it.url !in seen }) {
+                        seen += build.url
+                        store.upsert(server.id, build, BuildSource.RUNNING, userId)
+                    }
+                    store.retainRunning(server.id, urls)
+                }
+            }
+        } else {
+            synchronized(lock) { store.retainRunning(server.id, emptySet()) }
+        }
+        if (!showAll && server.trackOwnBuilds && userId != null) {
             step("executors", errors) {
                 var pending = client.runningRefs()
                 // Repeat so grandchildren are picked up once their parent became tracked in this poll.
@@ -277,13 +314,13 @@ class BuildMonitorService(private val cs: CoroutineScope) {
 
         // 4. Watched builds that left the executors or are not visible there: ask them directly.
         val stale = synchronized(lock) {
-            store.running(server.id).filter { it.build.url !in seen && it.sources.any { s -> s != BuildSource.VIEW } }
+            store.running(server.id).filter { it.build.url !in seen && it.sources.any { s -> s != BuildSource.VIEW && s != BuildSource.RUNNING } }
         }
         for (tracked in stale) {
             step("build", errors) {
                 try {
                     val build = client.build(tracked.build.url)
-                    val source = tracked.sources.first { it != BuildSource.VIEW }
+                    val source = tracked.sources.first { it != BuildSource.VIEW && it != BuildSource.RUNNING }
                     synchronized(lock) { store.upsert(server.id, build, source, userId) }?.let(finished::add)
                 } catch (e: JenkinsException) {
                     if (e.statusCode != 404) throw e
@@ -296,7 +333,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
     private fun checkInputs(server: ServerConfig, client: JenkinsClient) {
         val now = System.currentTimeMillis()
         val running = synchronized(lock) { store.running(server.id) }
-            .filter { it.build.isPipeline && (it.mine || BuildSource.PINNED in it.sources || BuildSource.BRANCH in it.sources) }
+            .filter { it.build.isPipeline && (it.mine || it.sources.any { s -> s == BuildSource.PINNED || s == BuildSource.WATCHED || s == BuildSource.BRANCH }) }
         val runningKeys = running.map { it.key }.toSet()
         inputs.keys.removeIf { it.startsWith(server.id + " ") && it !in runningKeys }
         for (tracked in running) {
@@ -331,7 +368,8 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         if (failures > 0) return minOf(server.idlePollSeconds.toLong() shl minOf(failures - 1, 4), MAX_BACKOFF_SECONDS)
         val active = server.activePollSeconds.toLong()
         val queuedHere = queued.values.any { it.serverId == server.id }
-        val running = synchronized(lock) { store.running(server.id) }
+        // Builds only listed by "all running builds" do not speed up polling.
+        val running = synchronized(lock) { store.running(server.id) }.filter { it.sources != setOf(BuildSource.RUNNING) }
         val delay = when {
             queuedHere -> active
             running.isNotEmpty() -> {
@@ -357,6 +395,13 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         for (pin in settings.pinnedJobs.filter { it.serverId == server.id }) {
             try {
                 client.recentBuilds(pin.url, settings.buildsPerPinnedJob).forEach { results += it to BuildSource.PINNED }
+            } catch (e: JenkinsException) {
+                if (e.statusCode != 404) throw e
+            }
+        }
+        for (watched in settings.watchedJobs.filter { it.serverId == server.id }) {
+            try {
+                client.recentBuilds(watched.url, settings.buildsPerPinnedJob).forEach { results += it to BuildSource.WATCHED }
             } catch (e: JenkinsException) {
                 if (e.statusCode != 404) throw e
             }

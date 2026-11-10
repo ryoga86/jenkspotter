@@ -143,11 +143,11 @@ object BuildActions {
         }
     }
 
-    private suspend fun clientFor(serverId: String) = withContext(Dispatchers.IO) {
+    internal suspend fun clientFor(serverId: String) = withContext(Dispatchers.IO) {
         JenkinsConnections.getInstance().client(serverId)
     } ?: throw JenkinsException(JenkSpotterBundle.message("error.noToken"))
 
-    private suspend fun runReporting(project: Project, block: suspend () -> Unit) {
+    internal suspend fun runReporting(project: Project, block: suspend () -> Unit) {
         try {
             block()
         } catch (e: CancellationException) {

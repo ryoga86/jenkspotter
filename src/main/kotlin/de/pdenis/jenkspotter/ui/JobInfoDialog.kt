@@ -114,16 +114,24 @@ class JobInfoDialog(project: Project, private val hit: JobHit) : DialogWrapper(p
 
     companion object {
         /** Indented follow-up tree as HTML. */
-        fun chainHtml(chain: List<ChainNode>): String {
+        /** [highlight]: full name of a job shown in bold (the one the tooltip is about). */
+        fun chainHtml(chain: List<ChainNode>, highlight: String? = null): String {
             val out = StringBuilder()
-            fun walk(nodes: List<ChainNode>, depth: Int) {
+            // Disabled jobs are struck through; everything below them is greyed, it is never triggered.
+            fun walk(nodes: List<ChainNode>, depth: Int, reached: Boolean) {
                 for (node in nodes) {
+                    val name = StringUtil.escapeXmlEntities(JenkinsPaths.displayName(node.fullName))
                     out.append("<br>").append("&nbsp;&nbsp;&nbsp;&nbsp;".repeat(depth)).append("&#8627; ")
-                        .append(StringUtil.escapeXmlEntities(JenkinsPaths.displayName(node.fullName)))
-                    walk(node.children, depth + 1)
+                    when {
+                        node.disabled -> out.append("<s>").append(name).append("</s> <i>").append(JenkSpotterBundle.message("jobs.disabled")).append("</i>")
+                        !reached -> out.append("<font color='gray'>").append(name).append(" <i>").append(JenkSpotterBundle.message("jobs.notReached")).append("</i></font>")
+                        node.fullName == highlight -> out.append("<b>").append(name).append("</b>")
+                        else -> out.append(name)
+                    }
+                    walk(node.children, depth + 1, reached && !node.disabled)
                 }
             }
-            walk(chain, 0)
+            walk(chain, 0, true)
             return out.toString()
         }
     }

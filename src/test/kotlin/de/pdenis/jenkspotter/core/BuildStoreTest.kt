@@ -83,6 +83,64 @@ class BuildStoreTest {
     }
 
     @Test
+    fun `sort modes order by name, path or recent use and can keep pins on top`() {
+        val jobs = listOf(
+            JobRef("zeta", "a/zeta", "u1", "hudson.model.FreeStyleProject"),
+            JobRef("alpha", "b/alpha", "u2", "hudson.model.FreeStyleProject"),
+            JobRef("mid", "c/mid", "u3", "hudson.model.FreeStyleProject"),
+        ).map { "s" to it }
+        fun urls(sort: de.pdenis.jenkspotter.settings.JobSort, pinnedFirst: Boolean = true) =
+            JobIndexService.rank(jobs, "", pinned = setOf("s u3"), recent = mapOf("s u1" to 0), sort = sort, pinnedFirst = pinnedFirst).map { it.job.url }
+        assertEquals(listOf("u3", "u2", "u1"), urls(de.pdenis.jenkspotter.settings.JobSort.NAME))
+        assertEquals(listOf("u2", "u3", "u1"), urls(de.pdenis.jenkspotter.settings.JobSort.NAME, pinnedFirst = false))
+        assertEquals(listOf("u1", "u2", "u3"), urls(de.pdenis.jenkspotter.settings.JobSort.PATH, pinnedFirst = false))
+        assertEquals(listOf("u1", "u2", "u3"), urls(de.pdenis.jenkspotter.settings.JobSort.RECENT, pinnedFirst = false))
+    }
+
+    @Test
+    fun `same job on two Jenkins is told apart by part of the Jenkins name`() {
+        val job = JobRef("job-a", "job-a", "", "hudson.model.FreeStyleProject")
+        val jobs = listOf("a" to job.copy(url = "ua"), "b" to job.copy(url = "ub"))
+        val names = mapOf("a" to "Jenkins Alpha", "b" to "Jenkins Beta")
+        fun urls(query: String) = JobIndexService.rank(jobs, query, serverNames = names).map { it.job.url }
+        assertEquals(listOf("ub"), urls("beta job-a"))
+        assertEquals(listOf("ub"), urls("@bet job"))
+        assertEquals(listOf("ua"), urls("alpha: job"))
+        // The matched part of the Jenkins name is highlighted.
+        assertEquals(listOf(8..11), JobIndexService.rank(jobs, "beta job", serverNames = names).single().match.serverRanges)
+        // With a single Jenkins its name is no search field, only @name picks it.
+        assertEquals(emptyList<String>(), JobIndexService.rank(listOf(jobs[1]), "beta", serverNames = mapOf("b" to "Jenkins Beta")).map { it.job.url })
+        assertEquals(listOf("ub"), JobIndexService.rank(listOf(jobs[1]), "@beta", serverNames = mapOf("b" to "Jenkins Beta")).map { it.job.url })
+    }
+
+    @Test
+    fun `durations are shown without milliseconds`() {
+        assertEquals("0 s", de.pdenis.jenkspotter.ui.BuildsPanel.formatDuration(120))
+        assertEquals("45 s", de.pdenis.jenkspotter.ui.BuildsPanel.formatDuration(45_200))
+        assertEquals("12 m 30 s", de.pdenis.jenkspotter.ui.BuildsPanel.formatDuration(750_000))
+        assertEquals("1 h 5 m", de.pdenis.jenkspotter.ui.BuildsPanel.formatDuration(3_930_000))
+    }
+
+    @Test
+    fun `watched builds are replaced by the next slow poll like pinned ones`() {
+        val store = BuildStore()
+        store.applySlowPoll("s", listOf(build("a", 1, BuildResult.SUCCESS, user = "bob") to BuildSource.WATCHED), "alice")
+        assertTrue(BuildSource.WATCHED in store.get("s", "https://ci/job/a/1/")!!.sources)
+        store.applySlowPoll("s", emptyList(), "alice")
+        assertNull(store.get("s", "https://ci/job/a/1/"))
+    }
+
+    @Test
+    fun `connection state distinguishes disabled, offline and errors`() {
+        fun status(online: Boolean, reachable: Boolean) = ServerStatus("s", online, if (online) null else "x", "alice", 0, reachable)
+        assertEquals(ConnectionState.DISABLED, ConnectionState.of(false, status(true, true)))
+        assertEquals(ConnectionState.CONNECTING, ConnectionState.of(true, null))
+        assertEquals(ConnectionState.CONNECTED, ConnectionState.of(true, status(true, true)))
+        assertEquals(ConnectionState.ERROR, ConnectionState.of(true, status(false, true)))
+        assertEquals(ConnectionState.OFFLINE, ConnectionState.of(true, status(false, false)))
+    }
+
+    @Test
     fun `user id comparison ignores case`() {
         val store = BuildStore()
         store.upsert("s", build("a", 1, BuildResult.RUNNING, user = "PDenis"), BuildSource.OWN, "pdenis")
@@ -96,5 +154,19 @@ class BuildStoreTest {
         store.upsert("s2", build("a", 1, BuildResult.RUNNING), BuildSource.OWN, "alice")
         store.applySlowPoll("s2", emptyList(), "alice")
         assertEquals(2, store.all().size)
+    }
+
+    @Test
+    fun `builds listed only as running disappear when they leave the executors`() {
+        val store = BuildStore()
+        val other = build("other", 1, BuildResult.RUNNING, user = "bob")
+        val pinnedToo = build("pinned", 2, BuildResult.RUNNING, user = "bob")
+        store.upsert("s", other, BuildSource.RUNNING, "alice")
+        store.upsert("s", pinnedToo, BuildSource.RUNNING, "alice")
+        store.upsert("s", pinnedToo, BuildSource.PINNED, "alice")
+        store.retainRunning("s", setOf(other.url, pinnedToo.url))
+        assertEquals(2, store.all().size)
+        store.retainRunning("s", emptySet())
+        assertEquals(listOf(setOf(BuildSource.PINNED)), store.all().map { it.sources })
     }
 }

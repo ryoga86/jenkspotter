@@ -1,21 +1,14 @@
 package de.pdenis.jenkspotter.ui
 
-import com.intellij.openapi.actionSystem.ActionUpdateThread
-import com.intellij.openapi.actionSystem.AnAction
-import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
-import com.intellij.openapi.actionSystem.Presentation
-import com.intellij.openapi.actionSystem.ex.CustomComponentAction
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
-import com.intellij.openapi.wm.ex.ToolWindowEx
 import com.intellij.ui.content.ContentManagerEvent
 import com.intellij.ui.content.ContentManagerListener
 import de.pdenis.jenkspotter.JenkSpotterBundle
 import de.pdenis.jenkspotter.core.BuildMonitorService
-import javax.swing.JComponent
 
 class JenkSpotterToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun init(toolWindow: ToolWindow) {
@@ -30,8 +23,6 @@ class JenkSpotterToolWindowFactory : ToolWindowFactory, DumbAware {
         toolWindow.setAdditionalGearActions(DefaultActionGroup(ServersToggleGroup(), DiagnoseAction()))
 
         val main = JenkSpotterMainPanel(project)
-        // The filter bar lives in the header, next to the tool window name.
-        (toolWindow as? ToolWindowEx)?.setTabActions(HeaderBarAction(main.headerBar))
 
         val contents = toolWindow.contentManager
         val overview = contents.factory.createContent(main, "", false).apply {
@@ -49,12 +40,6 @@ class JenkSpotterToolWindowFactory : ToolWindowFactory, DumbAware {
                 overview.displayName = if (contents.contentCount > 1) JenkSpotterBundle.message("tab.overview") else ""
             }
         })
-    }
-
-    private class HeaderBarAction(private val bar: JComponent) : AnAction(), CustomComponentAction, DumbAware {
-        override fun actionPerformed(e: AnActionEvent) = Unit
-        override fun createCustomComponent(presentation: Presentation, place: String): JComponent = bar
-        override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
     companion object {

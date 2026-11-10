@@ -22,7 +22,10 @@ import com.intellij.ui.dsl.builder.panel
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.WrapLayout
 import de.pdenis.jenkspotter.JenkSpotterBundle
+import de.pdenis.jenkspotter.core.BuildMonitorListener
 import de.pdenis.jenkspotter.core.BuildMonitorService
+import de.pdenis.jenkspotter.core.JobIndexListener
+import de.pdenis.jenkspotter.core.MonitorSnapshot
 import de.pdenis.jenkspotter.core.HiddenJobs
 import de.pdenis.jenkspotter.settings.JenkSpotterConfigurable
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
@@ -52,7 +55,9 @@ class SharedFilter {
 
     fun hidden(): HiddenJobs = HiddenJobs.of(JenkSpotterSettings.getInstance().current)
 
-    fun includes(serverId: String) = this.serverId == null || this.serverId == serverId
+    /** Selected in the Jenkins combo (or all selected) and not hidden with its eye. */
+    fun includes(serverId: String) =
+        (this.serverId == null || this.serverId == serverId) && serverId !in JenkSpotterSettings.getInstance().current.hiddenServers
 
     fun serverIds(): List<String> =
         JenkSpotterSettings.getInstance().activeServers.map { it.id }.filter(::includes)
@@ -65,18 +70,17 @@ class SharedFilter {
 }
 
 /**
- * Tool window content: Jobs (left) and Builds (right). The global bar (Jenkins, filter chips,
- * folder filter) is not part of the content but shown in the tool window header, see [headerBar].
+ * Tool window content: the Jenkins view (left: jobs per Jenkins, with the Jenkins selection on top
+ * and connection lights plus filter chips at the bottom) and the builds view (right: builds table,
+ * build info below).
  */
 class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
     val filter = SharedFilter()
     val jobs = JobsPanel(project, filter)
     private val builds = BuildsPanel(project, filter)
     private val serverCombo = ComboBox<ServerItem>()
-    private val filterBar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(5), 0)).apply { isOpaque = false }
-
-    /** Placed into the tool window header right after "JenkSpotter". */
-    val headerBar: JComponent get() = filterBar
+    private val serverStatus = ServerStatusBar(project)
+    private val filterBar = JPanel(WrapLayout(FlowLayout.LEFT, JBUI.scale(5), JBUI.scale(2))).apply { isOpaque = false }
 
     @Volatile
     private var disposed = false
@@ -86,15 +90,44 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
             val id = (serverCombo.selectedItem as? ServerItem)?.id
             if (id != filter.serverId) filter.serverId = id
         }
+        // The Jenkins view stops at its minimum width; the builds view may still be dragged narrow.
+        builds.minimumSize = JBUI.size(150, 0)
         add(OnePixelSplitter(false, "JenkSpotter.JobsBuilds", 0.4f).apply {
+            setHonorComponentsMinimumSize(true)
             firstComponent = jobs
             secondComponent = builds
         }, BorderLayout.CENTER)
+        jobs.setBottomBar(JPanel(com.intellij.ui.components.panels.VerticalLayout(0)).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(2, 4, 0, 4)
+            add(serverStatus)
+            add(filterBar)
+        })
 
-        ApplicationManager.getApplication().messageBus.connect(this).subscribe(SettingsListener.TOPIC, SettingsListener {
+        val connection = ApplicationManager.getApplication().messageBus.connect(this)
+        connection.subscribe(SettingsListener.TOPIC, SettingsListener {
             ApplicationManager.getApplication().invokeLater({ rebuildBar(); filter.fire() }, { disposed || project.isDisposed })
         })
+        // Connection lights: only repainted when a server's state actually changed.
+        connection.subscribe(BuildMonitorListener.TOPIC, object : BuildMonitorListener {
+            override fun snapshotChanged(snapshot: MonitorSnapshot) {
+                ApplicationManager.getApplication().invokeLater({ updateServerStatus(snapshot) }, { disposed || project.isDisposed })
+            }
+        })
+        connection.subscribe(JobIndexListener.TOPIC, JobIndexListener {
+            ApplicationManager.getApplication().invokeLater({ updateServerStatus(BuildMonitorService.getInstance().snapshot, force = true) }, { disposed || project.isDisposed })
+        })
         rebuildBar()
+    }
+
+    private var shownStatus: Any? = null
+
+    private fun updateServerStatus(snapshot: MonitorSnapshot, force: Boolean = false) {
+        val settings = JenkSpotterSettings.getInstance().current
+        val key = settings.servers.map { Triple(it.id, it.displayName, snapshot.servers[it.id]?.let { s -> s.copy(lastUpdate = 0) } to it.enabled) }
+        if (!force && key == shownStatus) return
+        shownStatus = key
+        serverStatus.update(snapshot)
     }
 
     private fun rebuildBar() {
@@ -106,18 +139,19 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
         serverCombo.selectedItem = target
         if (target?.id != filter.serverId) filter.serverId = target?.id
 
-        // Order: Jenkins selection | job filters | folder filter.
+        // Jenkins selection above the jobs, lights and filters (job filters | folder filter) below.
+        jobs.setServerSelector(serverCombo.takeIf { items.size > 1 })
+        serverStatus.isVisible = JenkSpotterSettings.getInstance().current.servers.isNotEmpty()
+        updateServerStatus(BuildMonitorService.getInstance().snapshot, force = true)
         filterBar.removeAll()
         fun separator() = JSeparator(SwingConstants.VERTICAL).apply { preferredSize = JBUI.size(1, 16) }
-        filterBar.add(separator())
-        if (items.size > 1) {
-            filterBar.add(serverCombo)
-            filterBar.add(separator())
-        }
         val filters = JenkSpotterSettings.getInstance().current.filters
+        filterBar.add(projectChip())
         for (f in filters.filter { !it.isFolderRule }) filterBar.add(filterChip(f))
-        filterBar.add(ActionLink(JenkSpotterBundle.message("filter.add")) { editFilter(null) }.apply {
+        filterBar.add(ActionLink(JenkSpotterBundle.message("filter.add")).apply {
             toolTipText = JenkSpotterBundle.message("filter.add.tooltip")
+            setDropDownLinkIcon()
+            addActionListener { filterMenu().show(this, 0, height) }
         })
         filterBar.add(separator())
         filters.firstOrNull { it.isFolderRule }?.let { filterBar.add(filterChip(it)) }
@@ -126,6 +160,56 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
         })
         filterBar.revalidate()
         filterBar.repaint()
+    }
+
+    /** "New Filter..." and every existing rule with enable/disable, edit, switch mode and remove. */
+    private fun filterMenu() = JBPopupMenu().apply {
+        val settings = JenkSpotterSettings.getInstance()
+        add(menuItem(JenkSpotterBundle.message("filter.new"), AllIcons.General.Add) { editFilter(null) })
+        add(menuItem(JenkSpotterBundle.message("filter.folders"), AllIcons.Nodes.Folder) { FolderFilterDialog.open(project) })
+        val filters = settings.current.filters
+        if (filters.isNotEmpty()) addSeparator()
+        for (f in filters) {
+            val prefix = if (f.mode == FilterMode.INCLUDE) "+" else "\u2212"
+            add(javax.swing.JMenu("$prefix ${f.label}").apply {
+                if (!f.enabled || f.regexOrNull() == null) foreground = com.intellij.util.ui.UIUtil.getInactiveTextColor()
+                if (f.regexOrNull() != null) {
+                    add(menuItem(JenkSpotterBundle.message(if (f.enabled) "filter.disable" else "filter.enable"), null) { settings.setFilterEnabled(f.id, !f.enabled) })
+                }
+                add(menuItem(JenkSpotterBundle.message("filter.edit"), AllIcons.Actions.Edit) {
+                    if (f.isFolderRule) FolderFilterDialog.open(project) else editFilter(f)
+                })
+                if (!f.isFolderRule) {
+                    val toInclude = f.mode == FilterMode.EXCLUDE
+                    add(menuItem(JenkSpotterBundle.message(if (toInclude) "filter.switch.toInclude" else "filter.switch.toExclude"), null) {
+                        settings.saveFilter(f.copy().apply { mode = if (toInclude) FilterMode.INCLUDE else FilterMode.EXCLUDE })
+                    })
+                }
+                addSeparator()
+                add(menuItem(JenkSpotterBundle.message("filter.remove"), AllIcons.General.Remove) { settings.removeFilter(f.id) })
+            })
+        }
+    }
+
+    private fun menuItem(text: String, icon: javax.swing.Icon?, action: () -> Unit) =
+        JMenuItem(text, icon).apply { addActionListener { action() } }
+
+    /** "This project": only jobs building one of the project's Git repositories (green = show only). */
+    private fun projectChip(): JComponent {
+        val settings = JenkSpotterSettings.getInstance()
+        val rule = RegexFilter().apply {
+            name = JenkSpotterBundle.message("filter.project", project.name)
+            mode = FilterMode.INCLUDE
+            enabled = settings.current.projectJobsOnly
+        }
+        return FilterChip(
+            rule,
+            onToggle = { on -> settings.updateView { projectJobsOnly = on } },
+            onEdit = null,
+            onSwitchMode = null,
+            onRemove = null,
+            tooltip = "<html>" + JenkSpotterBundle.message("filter.project.tooltip") + "<br>" + JenkSpotterBundle.message("filter.chip.help") + "</html>",
+        )
     }
 
     private fun filterChip(f: RegexFilter): JComponent {
@@ -142,6 +226,18 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
     }
 
     private fun editFilter(existing: RegexFilter?) = FilterActions.edit(project, existing)
+
+    /** Selects a job in the jobs list; switches the Jenkins selection if it hides that server. */
+    fun reveal(serverId: String, url: String, query: String) {
+        if (serverId in JenkSpotterSettings.getInstance().current.hiddenServers) {
+            JenkSpotterSettings.getInstance().setServerHidden(serverId, false)
+        }
+        if (!filter.includes(serverId)) {
+            val items = (0 until serverCombo.itemCount).map(serverCombo::getItemAt)
+            serverCombo.selectedItem = items.firstOrNull { it.id == null } ?: items.firstOrNull { it.id == serverId }
+        }
+        jobs.reveal(serverId, url, query)
+    }
 
     override fun dispose() {
         disposed = true

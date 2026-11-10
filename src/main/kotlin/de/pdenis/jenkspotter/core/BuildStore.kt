@@ -72,7 +72,7 @@ class BuildStore(private val clock: () -> Long = System::currentTimeMillis) {
         results: List<Pair<BuildInfo, BuildSource>>,
         userId: String?,
     ): List<TrackedBuild> {
-        val slow = setOf(BuildSource.PINNED, BuildSource.VIEW, BuildSource.BRANCH)
+        val slow = setOf(BuildSource.PINNED, BuildSource.WATCHED, BuildSource.VIEW, BuildSource.BRANCH)
         for ((key, tracked) in builds.entries.toList()) {
             if (tracked.serverId == serverId && tracked.sources.any { it in slow }) {
                 builds[key] = tracked.copy(sources = tracked.sources - slow)
@@ -81,6 +81,18 @@ class BuildStore(private val clock: () -> Long = System::currentTimeMillis) {
         val finished = results.mapNotNull { (build, source) -> upsert(serverId, build, source, userId) }
         builds.entries.removeIf { it.value.serverId == serverId && it.value.sources.isEmpty() }
         return finished
+    }
+
+    /**
+     * "All running builds": builds listed only because they ran ([BuildSource.RUNNING]) and are no
+     * longer in [stillRunning] are dropped; their result is not fetched and not notified.
+     */
+    fun retainRunning(serverId: String, stillRunning: Set<String>) {
+        for ((key, tracked) in builds.entries.toList()) {
+            if (tracked.serverId != serverId || BuildSource.RUNNING !in tracked.sources || tracked.build.url in stillRunning) continue
+            val rest = tracked.sources - BuildSource.RUNNING
+            if (rest.isEmpty()) builds.remove(key) else builds[key] = tracked.copy(sources = rest)
+        }
     }
 
     /** Drops finished own builds older than [hours] and caps the own history size. */

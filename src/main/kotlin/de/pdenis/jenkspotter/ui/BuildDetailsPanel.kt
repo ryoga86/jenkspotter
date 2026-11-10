@@ -50,17 +50,35 @@ import javax.swing.JList
 import javax.swing.JPanel
 
 /**
- * Details of the selected build below the builds table: input step banner, stages, failed tests,
- * changes and artifacts. Loaded on selection, refreshed while the build runs.
+ * Details of the selected build below the builds table: input step banner, overview (what the
+ * optional table columns show, plus all parameters), stages, failed tests, changes and artifacts.
+ * Loaded on selection, refreshed while the build runs.
  */
 class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
-    private val title = JBLabel().apply { border = JBUI.Borders.empty(4, 6) }
+    private val title = JBLabel().apply { border = JBUI.Borders.empty(3, 6) }
+    private val toggle = JBLabel().apply { border = JBUI.Borders.empty(3, 6, 3, 0) }
+
+    /** Called after the user opened or closed the build info (title row click). */
+    var onCollapsedChanged: (Boolean) -> Unit = {}
+
+    /** Only the title row is shown; nothing is loaded until it is opened again. */
+    var collapsed: Boolean = de.pdenis.jenkspotter.settings.JenkSpotterSettings.getInstance().current.buildInfoCollapsed
+        private set
     private val inputBanner = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), JBUI.scale(2))).apply {
         background = JBUI.CurrentTheme.Banner.WARNING_BACKGROUND
         border = JBUI.Borders.customLine(JBUI.CurrentTheme.Banner.WARNING_BORDER_COLOR, 1, 0, 1, 0)
         isVisible = false
     }
     private val tabs = JBTabbedPane()
+    private val overview = object : javax.swing.table.DefaultTableModel(arrayOf<Any>("", ""), 0) {
+        override fun isCellEditable(row: Int, column: Int) = false
+    }
+    private val overviewTable = com.intellij.ui.table.JBTable(overview).apply {
+        tableHeader = null
+        setShowGrid(false)
+        columnModel.getColumn(0).apply { preferredWidth = JBUI.scale(120); maxWidth = JBUI.scale(260) }
+        setDefaultRenderer(Any::class.java, OverviewRenderer())
+    }
     private val stages = DefaultListModel<Stage>()
     private val tests = DefaultListModel<FailedTest>()
     private val changes = DefaultListModel<Change>()
@@ -78,9 +96,23 @@ class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), 
     init {
         border = JBUI.Borders.customLineTop(JBUI.CurrentTheme.ToolWindow.borderColor())
         add(JPanel(BorderLayout()).apply {
-            add(title, BorderLayout.NORTH)
+            add(JPanel(BorderLayout()).apply {
+                isOpaque = false
+                add(toggle, BorderLayout.WEST)
+                add(title, BorderLayout.CENTER)
+                cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+                toolTipText = JenkSpotterBundle.message("details.toggle")
+                object : com.intellij.ui.ClickListener() {
+                    override fun onClick(event: MouseEvent, clickCount: Int): Boolean {
+                        setCollapsed(!collapsed)
+                        onCollapsedChanged(collapsed)
+                        return true
+                    }
+                }.installOn(this)
+            }, BorderLayout.NORTH)
             add(inputBanner, BorderLayout.SOUTH)
         }, BorderLayout.NORTH)
+        tabs.addTab(JenkSpotterBundle.message("details.overview"), JBScrollPane(overviewTable))
         tabs.addTab(JenkSpotterBundle.message("details.stages"), JBScrollPane(stageList))
         tabs.addTab(JenkSpotterBundle.message("details.tests"), JBScrollPane(testList))
         tabs.addTab(JenkSpotterBundle.message("details.changes"), JBScrollPane(changeList))
@@ -114,21 +146,49 @@ class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), 
                 changeList.selectedValue?.let { com.intellij.openapi.ide.CopyPasteManager.getInstance().setContents(java.awt.datatransfer.StringSelection(it.commitId)) }
             })
         }, "JenkSpotter.ChangesPopup")
+        setCollapsed(collapsed)
         show(null)
+    }
+
+    fun setCollapsed(value: Boolean) {
+        val opened = collapsed && !value
+        collapsed = value
+        toggle.icon = if (value) AllIcons.General.ArrowRight else AllIcons.General.ArrowDown
+        tabs.isVisible = !value
+        updateInputBanner()
+        if (opened) current?.let(::load)
+        revalidate()
+        repaint()
     }
 
     fun show(build: TrackedBuild?) {
         val same = build?.key == current?.key
         current = build
-        isVisible = build != null
-        if (build == null) return
-        title.text = "<html><b>${StringUtil.escapeXmlEntities(build.build.displayName)}</b> - ${JenkSpotterBundle.message("result.${build.build.result.name}")}</html>"
-        title.icon = JenkSpotterIcons.forResult(build.build.result)
+        updateTitle()
+        if (build == null) {
+            tabs.isVisible = false
+            inputBanner.isVisible = false
+            return
+        }
+        tabs.isVisible = !collapsed
         updateInputBanner()
+        updateOverview(build)
         if (!same) {
             stages.clear(); tests.clear(); changes.clear(); artifacts.clear()
-            load(build)
+            if (!collapsed) load(build)
         }
+    }
+
+    private fun updateTitle() {
+        val build = current
+        if (build == null) {
+            title.text = JenkSpotterBundle.message("details.title")
+            title.icon = null
+            return
+        }
+        val name = BuildsPanel.jobLabel(build.serverId, build.build.jobFullName) + " #" + build.build.number
+        title.text = "<html><b>${StringUtil.escapeXmlEntities(name)}</b> - ${JenkSpotterBundle.message("result.${build.build.result.name}")}</html>"
+        title.icon = JenkSpotterIcons.forResult(build.build.result)
     }
 
     /** Called with every monitor snapshot: keeps the banner and running builds up to date. */
@@ -137,16 +197,17 @@ class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), 
         if (updated == null || updated.key != previous.key) return
         val finishedNow = previous.build.building && !updated.build.building
         current = updated
-        title.text = "<html><b>${StringUtil.escapeXmlEntities(updated.build.displayName)}</b> - ${JenkSpotterBundle.message("result.${updated.build.result.name}")}</html>"
-        title.icon = JenkSpotterIcons.forResult(updated.build.result)
+        updateTitle()
         updateInputBanner()
-        if (finishedNow) load(updated)
+        updateOverview(updated)
+        if (finishedNow && !collapsed) load(updated)
     }
 
     private fun updateInputBanner() {
         val build = current ?: return
         val input = BuildMonitorService.getInstance().snapshot.waitingInput[build.key]
         inputBanner.removeAll()
+        // Waiting builds show their banner even with the build info closed.
         inputBanner.isVisible = input != null && build.build.building
         if (input != null) {
             inputBanner.add(JBLabel(JenkSpotterBundle.message("details.input", input.message), AllIcons.General.BalloonWarning, JBLabel.LEFT))
@@ -172,15 +233,46 @@ class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), 
                 replace(tests, testResult.orEmpty())
                 replace(changes, details.changes)
                 replace(artifacts, details.artifacts)
-                tabs.setTitleAt(0, JenkSpotterBundle.message("details.stages") + count(stageResult?.size))
-                tabs.setTitleAt(1, JenkSpotterBundle.message("details.tests") + count(testResult?.size))
-                tabs.setTitleAt(2, JenkSpotterBundle.message("details.changes") + count(details.changes.size))
-                tabs.setTitleAt(3, JenkSpotterBundle.message("details.artifacts") + count(details.artifacts.size))
+                tabs.setTitleAt(TAB_STAGES, JenkSpotterBundle.message("details.stages") + count(stageResult?.size))
+                tabs.setTitleAt(TAB_STAGES + 1, JenkSpotterBundle.message("details.tests") + count(testResult?.size))
+                tabs.setTitleAt(TAB_STAGES + 2, JenkSpotterBundle.message("details.changes") + count(details.changes.size))
+                tabs.setTitleAt(TAB_STAGES + 3, JenkSpotterBundle.message("details.artifacts") + count(details.artifacts.size))
                 stageList.emptyText.text = JenkSpotterBundle.message(if (build.build.isPipeline) "details.noStages" else "details.notPipeline")
                 // Running builds: refresh stages (and the rest) every few seconds.
-                if (current?.build?.building == true) alarm.addRequest({ current?.let(::load) }, RUNNING_REFRESH_MILLIS)
+                if (current?.build?.building == true && !collapsed) alarm.addRequest({ current?.let(::load) }, RUNNING_REFRESH_MILLIS)
             }, modality)
         }, 0)
+    }
+
+    /** Key/value rows; parameters follow below their own heading row. */
+    private fun updateOverview(tracked: TrackedBuild) {
+        val b = tracked.build
+        val rows = mutableListOf<Pair<String, String>>()
+        fun row(key: String, value: String?) {
+            if (!value.isNullOrBlank()) rows += JenkSpotterBundle.message(key) to value
+        }
+        row("details.field.job", de.pdenis.jenkspotter.api.JenkinsPaths.displayName(b.jobFullName))
+        row("column.status", if (tracked.key in BuildMonitorService.getInstance().snapshot.waitingInput) JenkSpotterBundle.message("result.WAITING")
+            else JenkSpotterBundle.message("result.${b.result.name}"))
+        row("column.started", com.intellij.util.text.DateFormatUtil.formatDateTime(b.timestamp))
+        row("column.duration", BuildsPanel.durationText(tracked))
+        row("column.source", BuildsPanel.sourceText(tracked))
+        row("details.field.causes", b.causeDescriptions.distinct().joinToString("; "))
+        row("column.server", de.pdenis.jenkspotter.settings.JenkSpotterSettings.getInstance().server(tracked.serverId)?.displayName)
+        row("column.tests", b.tests?.let { t ->
+            if (t.failed > 0) JenkSpotterBundle.message("tests.failed", t.failed, t.total) else JenkSpotterBundle.message("tests.passed", t.total)
+        })
+        row("column.description", b.description?.let { StringUtil.stripHtml(it, " ") })
+        if (b.parameters.isNotEmpty()) {
+            rows += JenkSpotterBundle.message("column.parameters") to ""
+            b.parameters.forEach { rows += (PARAMETER_INDENT + it.name) to it.value.orEmpty() }
+        }
+        val current = (0 until overview.rowCount).map { overview.getValueAt(it, 0) to overview.getValueAt(it, 1) }
+        if (current == rows) return
+        val selectedRow = overviewTable.selectedRow
+        overview.rowCount = 0
+        rows.forEach { (k, v) -> overview.addRow(arrayOf<Any>(k, v)) }
+        if (selectedRow in 0 until overview.rowCount) overviewTable.setRowSelectionInterval(selectedRow, selectedRow)
     }
 
     private fun count(n: Int?) = if (n == null || n == 0) "" else " ($n)"
@@ -258,11 +350,25 @@ class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), 
 
     override fun dispose() = Unit
 
+    /** Keys grey, parameter heading bold, full value in the tooltip. */
+    private class OverviewRenderer : com.intellij.ui.ColoredTableCellRenderer() {
+        override fun customizeCellRenderer(table: javax.swing.JTable, value: Any?, selected: Boolean, hasFocus: Boolean, row: Int, column: Int) {
+            val text = value?.toString().orEmpty()
+            val heading = column == 0 && !text.startsWith(PARAMETER_INDENT) && table.getValueAt(row, 1).toString().isEmpty()
+            append(text, when {
+                heading -> SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES
+                column == 0 && !text.startsWith(PARAMETER_INDENT) -> SimpleTextAttributes.GRAYED_ATTRIBUTES
+                else -> SimpleTextAttributes.REGULAR_ATTRIBUTES
+            })
+            toolTipText = if (column == 1 && text.length > 40) "<html>" + StringUtil.escapeXmlEntities(text) + "</html>" else null
+        }
+    }
+
     private class StageRenderer : ColoredListCellRenderer<Stage>() {
         override fun customizeCellRenderer(list: JList<out Stage>, value: Stage, index: Int, selected: Boolean, hasFocus: Boolean) {
             icon = if (value.waitingForInput) AllIcons.General.BalloonWarning else JenkSpotterIcons.forResult(value.result)
             append(value.name)
-            val duration = StringUtil.formatDuration(value.durationMillis)
+            val duration = BuildsPanel.formatDuration(value.durationMillis)
             append("   $duration", SimpleTextAttributes.GRAYED_ATTRIBUTES)
             if (value.waitingForInput) append("   " + JenkSpotterBundle.message("details.stage.waiting"), SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, JBColor.ORANGE))
         }
@@ -298,5 +404,7 @@ class BuildDetailsPanel(private val project: Project) : JPanel(BorderLayout()), 
 
     companion object {
         private const val RUNNING_REFRESH_MILLIS = 5000
+        private const val TAB_STAGES = 1
+        private const val PARAMETER_INDENT = "    "
     }
 }

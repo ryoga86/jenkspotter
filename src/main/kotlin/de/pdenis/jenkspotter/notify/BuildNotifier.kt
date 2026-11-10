@@ -66,7 +66,8 @@ class BuildNotifier : BuildMonitorListener {
     }
 
     private fun shouldNotify(settings: JenkSpotterState, build: TrackedBuild): Boolean {
-        if (settings.notifyScope == NotifyScope.OWN_ONLY && !build.mine) return false
+        // Watched jobs exist to be notified about, whatever the scope.
+        if (settings.notifyScope == NotifyScope.OWN_ONLY && !build.mine && de.pdenis.jenkspotter.core.BuildSource.WATCHED !in build.sources) return false
         return when (build.build.result) {
             BuildResult.SUCCESS -> settings.notifySuccess
             BuildResult.FAILURE -> settings.notifyFailure
@@ -143,7 +144,7 @@ class BuildNotifier : BuildMonitorListener {
                 else -> "notification.aborted.title"
             }
             val title = JenkSpotterBundle.message(titleKey, job, build.build.number)
-            val content = JenkSpotterBundle.message("notification.content", StringUtil.formatDuration(build.build.durationMillis))
+            val content = JenkSpotterBundle.message("notification.content", de.pdenis.jenkspotter.ui.BuildsPanel.formatDuration(build.build.durationMillis))
             return create(result, title, content)
                 .addAction(action("action.openLog") { project, n -> BuildActions.openLog(project, build); n.expire() })
                 .addAction(action("action.rebuild") { project, n -> BuildActions.rebuild(project, build); n.expire() })
