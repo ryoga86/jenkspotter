@@ -1,4 +1,5 @@
 # Build, test and verify the plugin on every push to main/develop and on pull requests.
+# On main, a draft GitHub release is prepared; publishing that draft triggers release.yml.
 # The integration tests against the Docker Jenkins in docker/ are skipped here (they need docker/.env).
 # Based on https://github.com/JetBrains/intellij-platform-plugin-template
 
@@ -18,6 +19,12 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
+      - name: Maximize Build Space
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          preinstalled-runtimes: false
+          large-packages: false
+
       - name: Fetch Sources
         uses: actions/checkout@v7
 
@@ -44,6 +51,12 @@ jobs:
     needs: [ build ]
     runs-on: ubuntu-latest
     steps:
+      - name: Maximize Build Space
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          preinstalled-runtimes: false
+          large-packages: false
+
       - name: Fetch Sources
         uses: actions/checkout@v7
 
@@ -104,3 +117,47 @@ jobs:
         with:
           name: pluginVerifier-result
           path: ${{ github.workspace }}/build/reports/pluginVerifier
+
+  releaseDraft:
+    name: Release draft
+    # Only for pushes to main - develop is built and verified, but never prepares a release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ build, test, verify ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch Sources
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: true
+
+      - name: Remove Old Release Drafts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/{owner}/{repo}/releases \
+            --jq '.[] | select(.draft == true) | .id' \
+            | xargs -r -I '{}' gh api -X DELETE repos/{owner}/{repo}/releases/{}
+
+      - name: Create Release Draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(./gradlew properties --property version --quiet --console=plain | tail -n 1 | cut -f2- -d ' ')
+          RELEASE_NOTE="./build/tmp/release_note.txt"
+          ./gradlew getChangelog --unreleased --no-header --quiet --console=plain --output-file=$RELEASE_NOTE
+
+          gh release create $VERSION \
+            --draft \
+            --title $VERSION \
+            --notes-file $RELEASE_NOTE
