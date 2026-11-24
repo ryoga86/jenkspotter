@@ -88,11 +88,19 @@ class UiSmokeTest : BasePlatformTestCase() {
     }
 
     fun `test tool window wordmark is rendered by the IDE svg loader`() {
-        val icon = com.intellij.openapi.util.IconLoader.getIcon("/icons/toolWindow.svg", javaClass)
-        val image = java.awt.image.BufferedImage(icon.iconWidth, icon.iconHeight, java.awt.image.BufferedImage.TYPE_INT_ARGB)
-        val g = image.createGraphics()
-        icon.paintIcon(null, g, 0, 0)
-        g.dispose()
+        // Without a display (CI) the IconLoader hands out a 1x1 placeholder for every icon unless activated.
+        val headless = java.awt.GraphicsEnvironment.isHeadless()
+        if (headless) com.intellij.openapi.util.IconLoader.activate()
+        val image = try {
+            val icon = com.intellij.openapi.util.IconLoader.getIcon("/icons/toolWindow.svg", javaClass)
+            java.awt.image.BufferedImage(icon.iconWidth, icon.iconHeight, java.awt.image.BufferedImage.TYPE_INT_ARGB).also {
+                val g = it.createGraphics()
+                icon.paintIcon(null, g, 0, 0)
+                g.dispose()
+            }
+        } finally {
+            if (headless) com.intellij.openapi.util.IconLoader.deactivate()
+        }
         var top = 0
         var bottom = 0
         for (y in 0 until image.height) for (x in 0 until image.width) {
