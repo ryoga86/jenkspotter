@@ -84,6 +84,8 @@ class JenkinsClientIntegrationTest {
         val stages = client.stages(buildUrl)!!
         assertEquals(listOf("Build", "Test", "Package", "Approve"), stages.map { it.name }.take(4))
         assertTrue(stages.any { it.waitingForInput })
+        val buildLog = client.stageLog(buildUrl, stages.first { it.name == "Build" })!!
+        assertTrue(buildLog.toString(), buildLog.any { it.log.trim() == "compiling" })
 
         val failed = client.failedTests(buildUrl)!!
         assertEquals(listOf("com.example.service.OrderServiceTest.rejectsEmptyCart"), failed.map { "${it.className}.${it.name}" })
@@ -134,5 +136,27 @@ class JenkinsClientIntegrationTest {
             Thread.sleep(1000)
         }
         throw AssertionError("Condition not met within $timeoutMillis ms")
+    }
+
+    @Test
+    fun `nested stages as a tree and the log of a stage includes the stages nested in it`() {
+        val job = JenkinsPaths.jobUrl(client.baseUrl, "team/nested")
+        val queue = client.trigger(job, null)
+        val buildUrl = waitFor { client.queueItem(queue).executableUrl }
+        waitFor { client.recentBuilds(job, 1).firstOrNull { it.url == buildUrl && !it.building } }
+
+        val stages = client.stages(buildUrl)!!
+        assertEquals(listOf("Build", "Verify", "Deploy"), stages.map { it.name })
+        val verify = stages.first { it.name == "Verify" }
+        assertEquals(listOf("Unit", "Integration"), verify.children.map { it.name })
+        assertTrue(verify.children.all { it.parallel })
+        val integration = verify.children.first { it.name == "Integration" }
+        assertEquals(listOf("Setup", "Run", "Deep"), integration.flatten().drop(1).map { it.name })
+
+        // A parent stage has no steps of its own; its log is that of the stages nested in it.
+        val logs = client.stageLog(buildUrl, integration)!!.map { it.log.trim() }
+        assertTrue(logs.toString(), "setup db" in logs && "deep inside" in logs)
+        val unit = client.stageLog(buildUrl, verify.children.first { it.name == "Unit" })!!.joinToString("\n") { it.log }
+        assertTrue(unit, "\u001B[31mred error" in unit)
     }
 }

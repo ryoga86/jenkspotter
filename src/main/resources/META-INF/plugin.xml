@@ -1,18 +1,70 @@
+<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<!-- id, name, version, vendor, since-build and change-notes are patched from gradle.properties / CHANGELOG.md at build time. -->
 <idea-plugin>
     <id>de.pdenis.jenkspotter</id>
     <name>JenkSpotter</name>
-    <vendor>pdenis</vendor>
+    <vendor email="mail@pdenis.de" url="https://github.com/ryoga86/jenkspotter">Peter Denis</vendor>
+
+    <!--
+      The first ~165 characters of text become the teaser on the plugin card (Marketplace list, embeddable card),
+      cut at a word boundary.
+    -->
     <description><![CDATA[
-        <p><b>JenkSpotter</b> keeps an eye on your Jenkins builds while you keep working.</p>
+        <p><b>Keep an eye on your Jenkins builds while you keep working:</b> get notified when they finish or wait
+        for your approval, and start, rebuild, abort and read them without leaving the IDE.</p>
+
+        <p>Built for big Jenkins installations: hundreds of jobs in folders and multibranch pipelines, several
+        servers, and a lot of builds that are none of your business.</p>
+
+        <h3>Main features</h3>
         <ul>
-            <li>Tracks builds you started (from the IDE or anywhere else), pinned jobs and Jenkins views</li>
-            <li>Notifications with sound when a build finishes, OS notification when the IDE is in the background</li>
-            <li>Fuzzy search over all jobs, including folders and multibranch pipelines</li>
-            <li>Trigger builds with parameters, rebuild, abort, live console log</li>
-            <li>Multiple Jenkins instances, Basic auth with API token stored in the IDE password safe</li>
+            <li><b>Builds you care about</b> – builds you started anywhere (browser, CLI, IDE), pinned and watched
+                jobs, Jenkins views and the builds of the branch checked out in the project. Follow-up builds are
+                nested below the build that started them</li>
+            <li><b>Notifications</b> – when a build finishes, with sounds, an OS notification while the IDE is in the
+                background and a status bar widget. A pipeline waiting for an <code>input</code> step can be
+                answered or aborted right from the notification</li>
+            <li><b>Why a build failed</b> – rest the mouse on a failed build to see the failed stage, the failed
+                tests and the error lines of the log; errors are highlighted in the live console log and
+                <b>F2</b> jumps between them</li>
+            <li><b>Build details</b> – overview, stages (nested and parallel), failed tests (go to the test, run it
+                locally), changes, artifacts and the live console log</li>
+            <li><b>Find any job</b> – fuzzy search over all jobs including folders and multibranch pipelines from
+                anywhere with <i>Go to Jenkins Job</i> (<b>Cmd+Alt+Shift+J</b> on macOS,
+                <b>Ctrl+Alt+Shift+K</b> on Windows/Linux); paste a Jenkins URL to pin that job</li>
+            <li><b>Build with parameters</b> – string, text, boolean, choice, password, Active Choices, credentials
+                and run parameters. Values are remembered per job, <i>Rebuild</i> reuses the previous ones</li>
+            <li><b>Call graph</b> – which jobs trigger a job and what it triggers, as a graph, a tree or complete
+                paths; copy it as a Mermaid diagram</li>
+            <li><b>Filters</b> – status chips, regular expressions (with a builder), a folder tree and
+                <i>This project</i> cut a big Jenkins down to what matters to you</li>
+            <li><b>Several Jenkins servers</b> – each with its own user name and API token, with a connection light
+                per server</li>
         </ul>
+
+        <h3>Getting started</h3>
+        <ol>
+            <li>Create an API token in Jenkins under <i>your user | Security | API Token</i>.</li>
+            <li>Add your Jenkins in <i>Settings | Tools | JenkSpotter</i> with your user name and the token.
+                <i>Test Connection</i> shows under which user Jenkins knows you.</li>
+            <li>Open the <b>JenkSpotter</b> tool window.</li>
+        </ol>
+        <p>Optional Jenkins plugins that unlock more details: <i>Pipeline: Stage View</i> or
+            <i>Pipeline Graph View</i> (stages; nested and parallel ones need Pipeline Graph View), <i>JUnit</i>
+            (failed tests), <i>Blue Ocean</i> (to open builds there).</p>
+
+        <h3>Privacy</h3>
+        <p>JenkSpotter does not collect or transmit any data. It only connects to the Jenkins servers you configure,
+        using the IDE's proxy and certificate settings. API tokens are kept in the IDE password safe, never in a
+        settings file.</p>
+
+        <h3>Feedback</h3>
+        <p>Found a bug or have an idea? <a href="https://github.com/ryoga86/jenkspotter/issues">Open an issue on GitHub</a>.</p>
+
         <p>Icon based on the Jenkins logo by Charles Lowell and Frontside, licensed under
-        <a href="https://creativecommons.org/licenses/by-sa/3.0/">CC BY-SA 3.0</a>, <a href="https://jenkins.io/">jenkins.io</a>.</p>
+        <a href="https://creativecommons.org/licenses/by-sa/3.0/">CC BY-SA 3.0</a>, <a href="https://jenkins.io/">jenkins.io</a>.
+        JenkSpotter is not affiliated with or endorsed by the Jenkins project. Jenkins® is a registered trademark of
+        LF Charities Inc.</p>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>

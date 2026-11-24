@@ -9,6 +9,9 @@ enum class BuildSource {
 
     /** Seen on an executor while "all running builds" is on; dropped once it leaves the executors. */
     RUNNING,
+
+    /** One of the last finished builds of all jobs ([de.pdenis.jenkspotter.settings.JenkSpotterState.allBuildsHistory]). */
+    HISTORY,
 }
 
 data class TrackedBuild(
@@ -38,6 +41,11 @@ data class QueuedTrigger(
     val fromIde: Boolean = true,
 )
 
+/**
+ * [online]: the last poll worked - signed in, builds polled. [error]: why it did not. [warnings]:
+ * parts that failed although the Jenkins answered (e.g. its queue with 503); they do not make the
+ * Jenkins count as disconnected.
+ */
 data class ServerStatus(
     val serverId: String,
     val online: Boolean,
@@ -46,6 +54,7 @@ data class ServerStatus(
     val lastUpdate: Long,
     /** False if the last poll could not reach the server at all (network, DNS, timeout). */
     val reachable: Boolean = online,
+    val warnings: List<String> = emptyList(),
 ) {
     val state: ConnectionState
         get() = when {
@@ -58,7 +67,7 @@ data class ServerStatus(
 /** What the UI shows per configured server. */
 enum class ConnectionState {
     CONNECTING, CONNECTED,
-    /** Reachable, but authentication or a polling step failed. */
+    /** Reachable, but signing in failed or Jenkins did not answer usefully. */
     ERROR,
     /** Not reachable. */
     OFFLINE,

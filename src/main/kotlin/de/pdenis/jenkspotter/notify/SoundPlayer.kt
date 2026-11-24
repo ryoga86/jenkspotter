@@ -25,15 +25,14 @@ object SoundPlayer {
             BuildResult.FAILURE, BuildResult.UNSTABLE -> settings.customFailureSound
             else -> ""
         }
-        playWith(result, custom, settings.soundVolume, settings.wizardingMode)
+        playWith(result, custom, settings.soundVolume)
     }
 
     /** Plays with explicit values; used by the settings preview before anything is saved. */
-    fun playWith(result: BuildResult, customPath: String, volume: Int, wizardingMode: Boolean) {
-        val resource = when {
-            result == BuildResult.SUCCESS -> "success.wav"
-            result == BuildResult.FAILURE && wizardingMode -> "howler.wav"
-            result == BuildResult.FAILURE || result == BuildResult.UNSTABLE -> "failure.wav"
+    fun playWith(result: BuildResult, customPath: String, volume: Int) {
+        val resource = when (result) {
+            BuildResult.SUCCESS -> "success.wav"
+            BuildResult.FAILURE, BuildResult.UNSTABLE -> "failure.wav"
             else -> "aborted.wav"
         }
         ApplicationManager.getApplication().executeOnPooledThread {

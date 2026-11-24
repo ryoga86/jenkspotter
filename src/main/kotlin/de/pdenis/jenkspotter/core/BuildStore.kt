@@ -65,18 +65,20 @@ class BuildStore(private val clock: () -> Long = System::currentTimeMillis) {
 
     /**
      * Replaces the pinned/view membership of one server with a fresh poll result. Builds that are
-     * no longer referenced by any source are dropped.
+     * no longer referenced by any source are dropped. [keep]: memberships that could not be asked
+     * for this time (a job or view that failed to answer) and therefore stay as they are.
      */
     fun applySlowPoll(
         serverId: String,
         results: List<Pair<BuildInfo, BuildSource>>,
         userId: String?,
+        keep: (TrackedBuild, BuildSource) -> Boolean = { _, _ -> false },
     ): List<TrackedBuild> {
         val slow = setOf(BuildSource.PINNED, BuildSource.WATCHED, BuildSource.VIEW, BuildSource.BRANCH)
         for ((key, tracked) in builds.entries.toList()) {
-            if (tracked.serverId == serverId && tracked.sources.any { it in slow }) {
-                builds[key] = tracked.copy(sources = tracked.sources - slow)
-            }
+            if (tracked.serverId != serverId) continue
+            val dropped = tracked.sources.filter { it in slow && !keep(tracked, it) }
+            if (dropped.isNotEmpty()) builds[key] = tracked.copy(sources = tracked.sources - dropped.toSet())
         }
         val finished = results.mapNotNull { (build, source) -> upsert(serverId, build, source, userId) }
         builds.entries.removeIf { it.value.serverId == serverId && it.value.sources.isEmpty() }
@@ -84,35 +86,67 @@ class BuildStore(private val clock: () -> Long = System::currentTimeMillis) {
     }
 
     /**
-     * "All running builds": builds listed only because they ran ([BuildSource.RUNNING]) and are no
-     * longer in [stillRunning] are dropped; their result is not fetched and not notified.
+     * "All running builds": builds that left the executors ([stillRunning] no longer has them).
+     * Those listed only because they ran ([BuildSource.RUNNING]) stay listed and are returned, so
+     * their result can be fetched once; those also listed for another reason just lose the mark.
      */
-    fun retainRunning(serverId: String, stillRunning: Set<String>) {
+    fun endedRunning(serverId: String, stillRunning: Set<String>): List<TrackedBuild> {
+        val ended = mutableListOf<TrackedBuild>()
         for ((key, tracked) in builds.entries.toList()) {
-            if (tracked.serverId != serverId || BuildSource.RUNNING !in tracked.sources || tracked.build.url in stillRunning) continue
+            if (tracked.serverId != serverId || BuildSource.RUNNING !in tracked.sources || !tracked.build.building || tracked.build.url in stillRunning) continue
+            val rest = tracked.sources - BuildSource.RUNNING
+            if (rest.isEmpty()) ended += tracked else builds[key] = tracked.copy(sources = rest)
+        }
+        return ended
+    }
+
+    /**
+     * The last finished builds of all jobs: [keep] holds the URLs that are among them now. Builds
+     * that dropped out lose the mark, and are forgotten when nothing else lists them.
+     */
+    fun retainHistory(serverId: String, keep: Set<String>) {
+        for ((key, tracked) in builds.entries.toList()) {
+            if (tracked.serverId != serverId || BuildSource.HISTORY !in tracked.sources || tracked.build.url in keep) continue
+            val rest = tracked.sources - BuildSource.HISTORY
+            if (rest.isEmpty()) builds.remove(key) else builds[key] = tracked.copy(sources = rest)
+        }
+    }
+
+    /** "All running builds" switched off: forgets the builds listed only for it. */
+    fun dropRunningOnly(serverId: String) {
+        for ((key, tracked) in builds.entries.toList()) {
+            if (tracked.serverId != serverId || BuildSource.RUNNING !in tracked.sources) continue
             val rest = tracked.sources - BuildSource.RUNNING
             if (rest.isEmpty()) builds.remove(key) else builds[key] = tracked.copy(sources = rest)
         }
     }
 
-    /** Drops finished own builds older than [hours] and caps the own history size. */
+    fun remove(key: String) {
+        builds.remove(key)
+    }
+
+    /**
+     * Drops finished own builds, and finished builds listed only because they ran, older than
+     * [hours]; each of the two histories is capped at [maxOwn].
+     */
     fun prune(hours: Int, maxOwn: Int = 200) {
         val cutoff = clock() - hours * 60L * 60 * 1000
         val ownOnly = setOf(BuildSource.OWN, BuildSource.TRIGGERED, BuildSource.DOWNSTREAM)
-        builds.entries.removeIf { (_, t) ->
-            !t.build.building && t.sources.all { it in ownOnly } &&
-                t.build.timestamp + t.build.durationMillis < cutoff
+        val runningOnly = setOf(BuildSource.RUNNING)
+        for (history in listOf(ownOnly, runningOnly)) {
+            builds.entries.removeIf { (_, t) ->
+                !t.build.building && t.sources.all { it in history } &&
+                    t.build.timestamp + t.build.durationMillis < cutoff
+            }
+            builds.values.filter { t -> !t.build.building && t.sources.all { it in history } }
+                .sortedByDescending { it.build.timestamp }
+                .drop(maxOwn)
+                .forEach { builds.remove(it.key) }
         }
-        val own = builds.values.filter { t -> !t.build.building && t.sources.all { it in ownOnly } }
-            .sortedByDescending { it.build.timestamp }
-        own.drop(maxOwn).forEach { builds.remove(it.key) }
-    }
-
-    fun removeServer(serverId: String) {
-        builds.entries.removeIf { it.value.serverId == serverId }
     }
 
     fun retainServers(ids: Set<String>) {
         builds.entries.removeIf { it.value.serverId !in ids }
+        jobMaxNumber.keys.removeIf { it.substringBefore(' ') !in ids }
     }
 }

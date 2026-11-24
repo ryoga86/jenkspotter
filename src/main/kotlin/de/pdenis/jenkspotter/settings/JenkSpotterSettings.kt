@@ -111,115 +111,24 @@ enum class JobLayout(val key: String) {
     val grouped: Boolean get() = this == TREE || this == TREE_FOLDERS
 }
 
-/** Icon in front of the jobs in the Jenkins view; parameterized jobs get a small badge on top. */
-enum class JobIcon(val key: String, /** Entries of one group are listed together in the menu. */ val group: Int) {
-    PLAY("jobs.icon.play", 1),
-    RESUME("jobs.icon.resume", 1),
-    RUN_ALL("jobs.icon.runAll", 1),
-    RERUN("jobs.icon.rerun", 1),
-    APPLICATION("jobs.icon.application", 1),
-    COMPOUND("jobs.icon.compound", 1),
-    WAND("jobs.icon.wand", 2),
-    LEARN("jobs.icon.learn", 2),
-    GIFT("jobs.icon.gift", 2),
-    BULB("jobs.icon.bulb", 2),
-    STAR("jobs.icon.star", 2),
-    LIGHTNING("jobs.icon.lightning", 2),
-    RECORD("jobs.icon.record", 2),
-    HAMMER("jobs.icon.hammer", 3),
-    BUILD("jobs.icon.build", 3),
-    GEAR("jobs.icon.gear", 3),
-    TOOLBOX("jobs.icon.toolbox", 3),
-    TOOLS("jobs.icon.tools", 3),
-    STOPWATCH("jobs.icon.stopwatch", 3),
-    TARGET("jobs.icon.target", 3),
-    TASK("jobs.icon.task", 3),
-    PACKAGE("jobs.icon.package", 4),
-    ARCHIVE("jobs.icon.archive", 4),
-    DEPLOY("jobs.icon.deploy", 4),
-    UPLOAD("jobs.icon.upload", 4),
-    PUSH("jobs.icon.push", 4),
-    SERVER("jobs.icon.server", 4),
-    GLOBE("jobs.icon.globe", 4),
-    PLUGIN("jobs.icon.plugin", 4),
-    BRANCH("jobs.icon.branch", 5),
-    MERGE("jobs.icon.merge", 5),
-    CONSOLE("jobs.icon.console", 5),
-    CONFIG("jobs.icon.config", 5),
-    TAG("jobs.icon.tag", 5),
-    NONE("jobs.icon.none", 6),
+/**
+ * Filter chips of the builds table: build states and why a build is listed. Within each kind a
+ * green chip lets through only its builds; a red one hides them. Queued and expected rows count as [QUEUED].
+ */
+enum class BuildChip(val status: Boolean) {
+    RUNNING(true), SUCCESS(true), FAILURE(true), UNSTABLE(true), ABORTED(true), QUEUED(true),
+    MINE(false), BRANCH(false), WAITING(false), PINNED(false), WATCHED(false), VIEWS(false);
+
+    val key: String get() = "builds.chip.$name"
+    val tooltipKey: String get() = "builds.chip.$name.tooltip"
 }
 
-/** Mark of jobs with follow-up jobs in the Jenkins view, followed by their count. */
-enum class FollowUpIcon(val key: String) {
-    ARROW("jobs.followUpIcon.arrow"),
-    FORWARD("jobs.followUpIcon.forward"),
-    NEXT_STEP("jobs.followUpIcon.nextStep"),
-    FAST_FORWARD("jobs.followUpIcon.fastForward"),
-    STEP_INTO("jobs.followUpIcon.stepInto"),
-    LINK("jobs.followUpIcon.link"),
-    HIERARCHY("jobs.followUpIcon.hierarchy"),
-    TREE("jobs.followUpIcon.tree"),
-    DEPENDENCIES("jobs.followUpIcon.dependencies"),
-    BRANCH("jobs.followUpIcon.branch"),
-}
-
-/** What hides or shows a Jenkins' jobs and builds, next to its light at the bottom of the Jenkins view. */
-enum class VisibilityToggle(val key: String) {
-    EYE("jenkins.toggle.eye"),
-    EYE_CROSSED("jenkins.toggle.eyeCrossed"),
-    SMALL_EYE("jenkins.toggle.smallEye"),
-    SHOW("jenkins.toggle.show"),
-    CHECKMARK("jenkins.toggle.checkmark"),
-    BULB("jenkins.toggle.bulb"),
-    TRAFFIC("jenkins.toggle.traffic"),
-    VISIBILITY("jenkins.toggle.visibility"),
-    LOCK("jenkins.toggle.lock"),
-    LIKE("jenkins.toggle.like"),
-    STAR("jenkins.toggle.star"),
-    CHECKBOX("jenkins.toggle.checkbox"),
-    NONE("jenkins.toggle.none"),
-}
-
-/** How the Jenkins view shows which jobs trigger which (freestyle "Build other projects"). */
-enum class ChainDisplay(val key: String) {
-    /** Step number and follow-up count with icons, see [ChainStepIcon] and [FollowUpIcon]. */
-    BADGES("jobs.chainDisplay.badges"),
-    /** No marks; the selected job's chain is tinted and shown as a clickable path below the list. */
-    HIGHLIGHT("jobs.chainDisplay.highlight"),
-    /** Jobs of a chain listed together and joined by a line at the left edge. */
-    LANE("jobs.chainDisplay.lane"),
-    /** Follow-up jobs nested below the job that triggers them, expandable. */
-    TREE("jobs.chainDisplay.tree"),
-    /** A small arrow in front of triggered jobs and after triggering ones. */
-    ARROWS("jobs.chainDisplay.arrows"),
-    /** Only in the tooltip. */
-    NONE("jobs.chainDisplay.none"),
-}
-
-/** Mark of jobs triggered by other jobs: their step number, then this icon. */
-enum class ChainStepIcon(val key: String) {
-    SAME("jobs.chainStepIcon.same"),
-    TEXT("jobs.chainStepIcon.text"),
-    LINK("jobs.chainStepIcon.link"),
-    BACK("jobs.chainStepIcon.back"),
-    STEP_OUT("jobs.chainStepIcon.stepOut"),
-    CHEVRON("jobs.chainStepIcon.chevron"),
-    HIERARCHY("jobs.chainStepIcon.hierarchy"),
-    TREE("jobs.chainStepIcon.tree"),
-    DEPENDENCIES("jobs.chainStepIcon.dependencies"),
-    MERGE("jobs.chainStepIcon.merge"),
-    TRIGGERED("jobs.chainStepIcon.triggered"),
-}
-
-/** States the builds table can be filtered by; queued and expected rows count as [QUEUED]. */
-enum class BuildStatusFilter(val key: String) {
-    RUNNING("builds.status.running"),
-    SUCCESS("builds.status.success"),
-    FAILURE("builds.status.failure"),
-    UNSTABLE("builds.status.unstable"),
-    ABORTED("builds.status.aborted"),
-    QUEUED("builds.status.queued"),
+/** Views of the call graph popup. */
+enum class ChainView(val key: String) {
+    TOP_DOWN("chains.view.topDown"),
+    LEFT_RIGHT("chains.view.leftRight"),
+    TREE("chains.view.tree"),
+    PATHS("chains.view.paths"),
 }
 
 /** Which Jenkins page "Open in Browser" uses for builds. */
@@ -271,11 +180,12 @@ class JenkSpotterState {
     var buildColumnWidths: String = ""
     var showJobPath: Boolean = true
     var showFolderEntries: Boolean = true
-    var showDownstream: Boolean = true
-    /** "Step 2/4" next to jobs that are triggered by other jobs. */
-    var showChainStep: Boolean = true
-    var chainStepIcon: ChainStepIcon = ChainStepIcon.SAME
-    var chainDisplay: ChainDisplay = ChainDisplay.BADGES
+    /** "2 -> 3" behind jobs: triggered by 2 jobs, triggers 3. */
+    var showTriggers: Boolean = true
+    /** Thin strip at the left of jobs in a workflow, one colour per workflow. */
+    var showWorkflowColors: Boolean = true
+    /** Tint the jobs triggering / triggered by the job under the mouse. */
+    var highlightChainOnHover: Boolean = true
     /** Folder path in front of job names in the builds table. */
     var showBuildJobFolders: Boolean = true
     var jobSort: JobSort = JobSort.RELEVANCE
@@ -287,17 +197,26 @@ class JenkSpotterState {
     var collapsedFolders: MutableList<String> = mutableListOf()
     /** Build info below the builds table reduced to its title row. */
     var buildInfoCollapsed: Boolean = false
-    var jobIcon: JobIcon = JobIcon.PLAY
-    var followUpIcon: FollowUpIcon = FollowUpIcon.ARROW
-    var visibilityToggle: VisibilityToggle = VisibilityToggle.EYE_CROSSED
     /** List every build currently running on the Jenkins, not only the ones of interest (no notifications). */
     var showAllRunning: Boolean = false
+    /** With [showAllRunning]: also the last this many finished builds of all jobs, 0 = none. */
+    var allBuildsHistory: Int = 0
     /** Jenkins view lists only jobs building a Git repository of the open project. */
     var projectJobsOnly: Boolean = false
     /** Ids of the servers hidden with the eye in the Jenkins view: still polled and notified, just not listed. */
     var hiddenServers: MutableList<String> = mutableListOf()
-    /** [BuildStatusFilter] names not shown in the builds table. */
+    /** Filter chips of the builds table that are not off, entries are "[BuildChip] name=[ChipState] name". */
+    var buildChips: MutableList<String> = mutableListOf()
+    /** Status filter of versions before the chips; read once and turned into [buildChips], see [JenkSpotterSettings.migrate]. */
     var hiddenStatuses: MutableList<String> = mutableListOf()
+    /** Layout of this state, raised by [JenkSpotterSettings.migrate]. */
+    var stateVersion: Int = 0
+    /** Builds (each with its follow-ups) per page of the builds table. */
+    var buildsPageSize: Int = 50
+    /** Sort order of the builds table, "STARTED:desc" ([BuildColumn] name or JOB); empty = newest first. */
+    var buildSort: String = ""
+    /** How the call graph popup shows a job's triggers. */
+    var chainView: ChainView = ChainView.TOP_DOWN
 
     var notifySuccess: Boolean = true
     var notifyFailure: Boolean = true
@@ -316,7 +235,6 @@ class JenkSpotterState {
     var customSuccessSound: String = ""
     var customFailureSound: String = ""
 
-    var wizardingMode: Boolean = false
     var ownHistoryHours: Int = 24
     var buildsPerPinnedJob: Int = 5
     /** Builds listed by "Show Recent Builds" in the jobs list. */
@@ -331,11 +249,11 @@ class JenkSpotterState {
         it.rememberedParameters = rememberedParameters.toMutableMap(); it.rememberParameters = rememberParameters
         it.notifyInput = notifyInput; it.browserUi = browserUi
         it.buildColumns = buildColumns; it.buildColumnWidths = buildColumnWidths; it.showJobPath = showJobPath; it.showFolderEntries = showFolderEntries
-        it.showDownstream = showDownstream; it.showChainStep = showChainStep; it.chainStepIcon = chainStepIcon; it.chainDisplay = chainDisplay
+        it.showTriggers = showTriggers; it.showWorkflowColors = showWorkflowColors; it.highlightChainOnHover = highlightChainOnHover
         it.showBuildJobFolders = showBuildJobFolders; it.jobSort = jobSort; it.pinnedFirst = pinnedFirst
         it.jobLayout = jobLayout; it.collapsedServers = collapsedServers.toMutableList()
         it.collapsedFolders = collapsedFolders.toMutableList(); it.buildInfoCollapsed = buildInfoCollapsed
-        it.jobIcon = jobIcon; it.followUpIcon = followUpIcon; it.visibilityToggle = visibilityToggle; it.showAllRunning = showAllRunning; it.projectJobsOnly = projectJobsOnly; it.hiddenServers = hiddenServers.toMutableList(); it.hiddenStatuses = hiddenStatuses.toMutableList()
+        it.showAllRunning = showAllRunning; it.allBuildsHistory = allBuildsHistory; it.projectJobsOnly = projectJobsOnly; it.hiddenServers = hiddenServers.toMutableList(); it.buildChips = buildChips.toMutableList(); it.stateVersion = stateVersion; it.buildsPageSize = buildsPageSize; it.buildSort = buildSort; it.chainView = chainView
         it.notifySuccess = notifySuccess; it.notifyFailure = notifyFailure
         it.notifyUnstable = notifyUnstable; it.notifyAborted = notifyAborted
         it.notifyScope = notifyScope; it.systemNotificationWhenInactive = systemNotificationWhenInactive
@@ -343,7 +261,7 @@ class JenkSpotterState {
         it.groupNotifications = groupNotifications
         it.soundEnabled = soundEnabled; it.soundVolume = soundVolume
         it.customSuccessSound = customSuccessSound; it.customFailureSound = customFailureSound
-        it.wizardingMode = wizardingMode; it.ownHistoryHours = ownHistoryHours
+        it.ownHistoryHours = ownHistoryHours
         it.buildsPerPinnedJob = buildsPerPinnedJob; it.recentBuildsCount = recentBuildsCount
     }
 
@@ -358,7 +276,7 @@ class JenkSpotterState {
             browserUi == other.browserUi &&
             soundEnabled == other.soundEnabled && soundVolume == other.soundVolume &&
             customSuccessSound == other.customSuccessSound && customFailureSound == other.customFailureSound &&
-            wizardingMode == other.wizardingMode && ownHistoryHours == other.ownHistoryHours &&
+            ownHistoryHours == other.ownHistoryHours &&
             buildsPerPinnedJob == other.buildsPerPinnedJob && recentBuildsCount == other.recentBuildsCount
 }
 
@@ -383,7 +301,7 @@ class JenkSpotterSettings : PersistentStateComponent<JenkSpotterState> {
     override fun getState(): JenkSpotterState = stateRef
 
     override fun loadState(state: JenkSpotterState) {
-        stateRef = state
+        stateRef = migrate(state)
     }
 
     fun server(id: String): ServerConfig? = current.servers.firstOrNull { it.id == id }
@@ -459,7 +377,13 @@ class JenkSpotterSettings : PersistentStateComponent<JenkSpotterState> {
 
     fun removeFilter(id: String) = edit { filters.removeIf { it.id == id } }
 
-    fun setFilterEnabled(id: String, enabled: Boolean) = edit { filters.firstOrNull { it.id == id }?.enabled = enabled }
+    /** Switches a rule on or off; [mode] null keeps its mode. */
+    fun setFilterState(id: String, enabled: Boolean, mode: FilterMode? = null) = edit {
+        filters.firstOrNull { it.id == id }?.let { f ->
+            f.enabled = enabled
+            if (mode != null) f.mode = mode
+        }
+    }
 
     fun updateView(block: JenkSpotterState.() -> Unit) = edit(block)
 
@@ -468,6 +392,21 @@ class JenkSpotterSettings : PersistentStateComponent<JenkSpotterState> {
     }
 
     companion object {
+        const val STATE_VERSION = 1
+
+        /** Brings a state written by an older version up to date; settings that changed shape keep their meaning. */
+        fun migrate(state: JenkSpotterState): JenkSpotterState {
+            if (state.stateVersion < 1) {
+                // The status check boxes became filter chips: what was unchecked is a red chip now.
+                if (state.buildChips.isEmpty()) {
+                    state.buildChips = state.hiddenStatuses.filter { name -> BuildChip.entries.any { it.status && it.name == name } }
+                        .map { "$it=EXCLUDE" }.toMutableList()
+                }
+                state.hiddenStatuses = mutableListOf()
+            }
+            state.stateVersion = STATE_VERSION
+            return state
+        }
         const val MAX_RECENT = 30
 
         // name=value pairs, separated by control characters that never occur in Jenkins parameters.

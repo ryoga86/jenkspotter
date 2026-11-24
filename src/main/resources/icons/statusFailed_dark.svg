@@ -1,10 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path d="M8 2.2c3 0 4.9 2.3 4.9 5.6 0 3.6-2.2 6.2-4.9 6.2S3.1 11.4 3.1 7.8C3.1 4.5 5 2.2 8 2.2z" fill="#e0c3a0" stroke="#bdbdbd" stroke-width="0.8"/>
-  <path d="M2.6 7.2 2.4 4.6 3.8 4.4 3.6 2.6 5.4 3 5.8 1.2 7.3 2.4 8.4 0.8 9.3 2.3 11 1.3 11.1 3 13 2.8 12.5 4.5 13.6 5.2 12.9 6.6 11.9 5.4 10.6 6.2 9.4 4.9 8.3 5.4 7.4 4.6 6 5.6 4.9 4.9 3.9 6.3Z" fill="#121010"/>
-  <path d="M9.7 2.6 8.4 4.3 9.4 4.5 8.2 6.4" fill="none" stroke="#e5372b" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-  <g fill="none" stroke="#bdbdbd" stroke-width="0.9">
-    <circle cx="6" cy="8.6" r="1.7"/>
-    <circle cx="10.2" cy="8.6" r="1.7"/>
-    <path d="M7.7 8.6h0.8"/>
+  <path d="M8 1.1c2.7 0 4.5 2 4.5 4.8 0 2.9-2 4.9-4.5 4.9S3.5 8.8 3.5 5.9C3.5 3.1 5.3 1.1 8 1.1z" fill="#e0c3a0" stroke="#bdbdbd" stroke-width="0.8"/>
+  <path d="M3.6 6.8C3.1 4.6 4 2.6 5.7 1.8 4.9 3.1 4.7 4.8 5 6.4z" fill="#8c8c8c"/>
+  <path d="M12.4 6.8c.5-2.2-.4-4.2-2.1-5 .8 1.3 1 3 .7 4.6z" fill="#8c8c8c"/>
+  <g fill="none" stroke="#bdbdbd" stroke-width="0.8" stroke-linecap="round">
+    <path d="M5.6 5.5q.8-.7 1.5 0"/>
+    <path d="M8.9 5.5q.8-.7 1.5 0"/>
+    <path d="M6.2 7.8q1.8 1.2 3.6 0"/>
   </g>
+  <path d="M8 13.3 3.2 10.9v4.8zM8 13.3l4.8-2.4v4.8z" fill="#e5372b"/>
+  <circle cx="8" cy="13.3" r="1.3" fill="#e5372b" stroke="#bdbdbd" stroke-width="0.5"/>
 </svg>

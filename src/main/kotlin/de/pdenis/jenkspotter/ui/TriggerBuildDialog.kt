@@ -42,6 +42,8 @@ class TriggerBuildDialog(
     rememberByDefault: Boolean = true,
     titleText: String? = null,
     okText: String? = null,
+    /** Shown above the form: the same job may exist on several Jenkins (dev, prod). */
+    private val serverName: String? = null,
 ) : DialogWrapper(project) {
     private val initial = initialValues
     private val readers = LinkedHashMap<String, () -> String>()
@@ -60,6 +62,11 @@ class TriggerBuildDialog(
     val rememberValues: Boolean get() = remember.isSelected
 
     override fun createCenterPanel(): JComponent = panel {
+        if (serverName != null) {
+            val e = com.intellij.openapi.util.text.StringUtil::escapeXmlEntities
+            row { cell(JBLabel("<html>" + JenkSpotterBundle.message("dialog.trigger.target", "<b>" + e(serverName) + "</b>", e(jobName)) + "</html>")) }
+            separator()
+        }
         if (definitions.isEmpty()) {
             row { cell(JBLabel(JenkSpotterBundle.message("dialog.trigger.noParameters", jobName))) }
         }

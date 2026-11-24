@@ -12,7 +12,6 @@ import de.pdenis.jenkspotter.settings.JenkSpotterConfigurable
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
 import de.pdenis.jenkspotter.settings.JenkSpotterState
 import de.pdenis.jenkspotter.settings.ServerConfig
-import de.pdenis.jenkspotter.JenkSpotterBundle
 import de.pdenis.jenkspotter.notify.BuildNotifier
 
 /** Builds every UI component once so wiring errors surface in CI instead of in the IDE. */
@@ -101,8 +100,8 @@ class UiSmokeTest : BasePlatformTestCase() {
         }
         // The butler head is back; the stripe name is split by the IDE ("Jenk" / "Spotter").
         assertTrue("top=$top bottom=$bottom", top > 10 && bottom > 10)
-        assertEquals("Jenk Spotter", JenkSpotterToolWindowFactory.STRIPE_TITLE)
-        assertEquals("Jenk Spotter", de.pdenis.jenkspotter.JenkSpotterBundle.message("toolwindow.stripe.JenkSpotter"))
+        assertEquals("JenkSpotter", JenkSpotterToolWindowFactory.STRIPE_TITLE)
+        assertEquals("JenkSpotter", de.pdenis.jenkspotter.JenkSpotterBundle.message("toolwindow.stripe.JenkSpotter"))
     }
 
     fun `test job info dialog renders without a server`() {
@@ -119,13 +118,6 @@ class UiSmokeTest : BasePlatformTestCase() {
         } finally {
             Disposer.dispose(dialog.disposable)
         }
-    }
-
-    fun `test wizarding mode overrides texts and falls back`() {
-        val settings = JenkSpotterSettings.getInstance()
-        settings.update(settings.current.copy().apply { wizardingMode = true })
-        assertEquals("Accio Log", JenkSpotterBundle.message("action.openLog"))
-        assertEquals("Open in Browser", JenkSpotterBundle.message("action.openInBrowser"))
     }
 
     fun `test builds finishing together become one summary notification`() {

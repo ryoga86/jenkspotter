@@ -33,12 +33,24 @@ class JenkinsClient(
 ) {
     val baseUrl: String = JenkinsPaths.normalizeBase(baseUrl)
 
+    /** Scheme, host and port of the Jenkins: only requests to it carry the API token. */
+    private val origin = originOf(URI.create(this.baseUrl))
+
     private val json = Json { ignoreUnknownKeys = true }
     private val authHeader = "Basic " + Base64.getEncoder()
         .encodeToString("$username:$apiToken".toByteArray(StandardCharsets.UTF_8))
 
     @Volatile
     private var crumb: Pair<String, String>? = null
+
+    /**
+     * Drops cookies and crumb. Polling does not need a session (the token signs every request), but
+     * a load balancer may pin one to a Jenkins node by cookie - which keeps failing once that node is gone.
+     */
+    fun resetSession() {
+        http.cookieHandler().ifPresent { (it as? java.net.CookieManager)?.cookieStore?.removeAll() }
+        crumb = null
+    }
 
     // ---- identity -------------------------------------------------------------------------
 
@@ -91,6 +103,31 @@ class JenkinsClient(
             val job = j.obj() ?: return@mapNotNull null
             job["lastBuild"].obj()?.let { JenkinsJson.parseBuild(baseUrl, it, job.str("fullName")) }
         } ?: emptyList()
+    }
+
+    /**
+     * The newest builds of every job (folders four levels deep), URL, start and running state only.
+     * Jenkins has to look at every job for it, so ask rarely on a large instance.
+     */
+    fun recentBuildRefs(perJob: Int): List<BuildRef> {
+        val builds = "builds[url,timestamp,building]{0,$perJob}"
+        var tree = "jobs[$builds]"
+        repeat(3) { tree = "jobs[$builds,${tree}]" }
+        val root = getJson("api/json?tree=" + encodeTree(tree))
+        val result = mutableListOf<BuildRef>()
+        fun walk(node: JsonObject) {
+            node["jobs"].arr()?.forEach { child ->
+                val job = child.obj() ?: return@forEach
+                job["builds"].arr()?.forEach { b ->
+                    val build = b.obj() ?: return@forEach
+                    val url = build.str("url")?.let { JenkinsPaths.rebase(baseUrl, it) } ?: return@forEach
+                    result += BuildRef(url, with(JenkinsJson) { build.long("timestamp") }, with(JenkinsJson) { build.bool("building") })
+                }
+                walk(job)
+            }
+        }
+        walk(root)
+        return result
     }
 
     fun build(buildUrl: String): BuildInfo {
@@ -173,13 +210,63 @@ class JenkinsClient(
     // ---- build details --------------------------------------------------------------------
 
     /** Pipeline stages (Pipeline: Stage View plugin); null if not a pipeline or the plugin is missing. */
-    fun stages(buildUrl: String): List<Stage>? = optional {
-        JenkinsJson.parseStages(getJsonAbsolute(JenkinsPaths.rebase(baseUrl, buildUrl) + "wfapi/describe"))
+    fun stages(buildUrl: String): List<Stage>? {
+        val build = JenkinsPaths.rebase(baseUrl, buildUrl)
+        // Nested stages and parallel branches need the Pipeline Graph View plugin; Stage View lists them flat.
+        if (graphView != false) {
+            val tree = optional { JenkinsJson.parseStageTree(getJsonAbsolute(build + "stages/tree")) }
+            if (tree != null) return tree.also { graphView = true }
+        }
+        val flat = optional { JenkinsJson.parseStages(getJsonAbsolute(build + "wfapi/describe")) }
+        // Only a pipeline that Stage View knows and Graph View does not shows that the plugin is missing;
+        // a freestyle or deleted build answers 404 to both.
+        if (flat != null && graphView == null) graphView = false
+        return flat
+    }
+
+    /** Whether the Pipeline Graph View plugin answers; null = not known yet. */
+    @Volatile
+    private var graphView: Boolean? = null
+
+    /**
+     * The steps of one stage with their logs, so a stage's output can be shown on its own. Null if
+     * the build has no such stage (or no Pipeline REST API). At most [limit] steps; with
+     * [failedOnly] the failed or unstable ones (the last steps if none is marked), which is enough
+     * to say why a stage broke without fetching every log.
+     */
+    fun stageLog(buildUrl: String, stage: Stage, failedOnly: Boolean = false, limit: Int = MAX_STAGE_STEPS): List<StageStep>? {
+        val build = JenkinsPaths.rebase(baseUrl, buildUrl)
+        fun pick(steps: List<StageStep>): List<StageStep> {
+            if (!failedOnly) return steps.take(limit)
+            return steps.filter { it.status in BROKEN_STATES }.ifEmpty { steps }.takeLast(limit)
+        }
+        if (graphView == true) {
+            // Steps of the stage and of every stage nested in it, in pipeline order.
+            val ids = stage.flatten().map { it.id }.toSet()
+            val steps = optional { JenkinsJson.parseAllSteps(getJsonAbsolute(build + "stages/allSteps")) }?.filter { it.stageId in ids }
+            // An older build may have no graph data; Stage View still knows it.
+            if (steps != null) {
+                return pick(steps).map { step ->
+                    // Steps without output answer with this text instead of an empty body.
+                    val log = optional { getText(build + "stages/log?nodeId=" + encode(step.id)) }.orEmpty()
+                    step.copy(log = if (log.trim() == "No logs found") "" else log)
+                }
+            }
+        }
+        return optional { wfapiStageLog(build, stage.id, ::pick) }
+    }
+
+    private fun wfapiStageLog(build: String, stageId: String, pick: (List<StageStep>) -> List<StageStep>): List<StageStep> {
+        val node = build + "execution/node/"
+        return pick(JenkinsJson.parseStageSteps(getJsonAbsolute(node + JenkinsPaths.encodeSegment(stageId) + "/wfapi/describe"))).map { step ->
+            val (log, truncated) = optional { JenkinsJson.parseStepLog(getJsonAbsolute(node + JenkinsPaths.encodeSegment(step.id) + "/wfapi/log")) } ?: ("" to false)
+            step.copy(log = log, truncated = truncated)
+        }
     }
 
     /** Input steps the pipeline waits for; empty if none. */
     fun pendingInputs(buildUrl: String): List<PendingInput> = optional {
-        val body = send(request(JenkinsPaths.rebase(baseUrl, buildUrl) + "wfapi/pendingInputActions").GET().build()).body()
+        val body = send(request(JenkinsPaths.rebase(baseUrl, buildUrl) + "wfapi/pendingInputActions").GET().build(), expectJson = true).body()
         JenkinsJson.parsePendingInputs(json.parseToJsonElement(body) as kotlinx.serialization.json.JsonArray)
     } ?: emptyList()
 
@@ -214,13 +301,21 @@ class JenkinsClient(
     }
 
     fun download(url: String, target: java.nio.file.Path) {
-        val request = request(JenkinsPaths.rebase(baseUrl, url).removeSuffix("/")).GET().build()
-        val response = try {
-            http.send(request, HttpResponse.BodyHandlers.ofFile(target))
-        } catch (e: IOException) {
-            throw JenkinsException("Download failed: ${e.message}", cause = e)
+        // No gzip: the body is written to the file as it comes.
+        var next = URI.create(JenkinsPaths.rebase(baseUrl, url).removeSuffix("/"))
+        repeat(MAX_REDIRECTS) {
+            val response = try {
+                http.send(request(next.toString(), gzip = false).GET().build(), HttpResponse.BodyHandlers.ofFile(target))
+            } catch (e: IOException) {
+                throw JenkinsException("Download failed: ${e.message}", cause = e)
+            }
+            // Artifacts may live elsewhere (e.g. an object store); the token stays with Jenkins.
+            next = redirectTarget(response) ?: run {
+                if (response.statusCode() !in 200..299) throw JenkinsException("Download failed: HTTP ${response.statusCode()}", response.statusCode())
+                return
+            }
         }
-        if (response.statusCode() !in 200..299) throw JenkinsException("Download failed: HTTP ${response.statusCode()}", response.statusCode())
+        throw JenkinsException("Download failed: too many redirects")
     }
 
     /** Views of the server root and the user's "My Views". */
@@ -268,12 +363,16 @@ class JenkinsClient(
     private inline fun <T> optional(block: () -> T): T? = try {
         block()
     } catch (e: JenkinsException) {
-        if (e.statusCode == 404 || e.statusCode == 400 || e.cause is kotlinx.serialization.SerializationException ||
-            e.cause is ClassCastException
+        // A login page is not "feature missing": the caller has to see that sign-in is needed.
+        if (e.statusCode != 401 && (e.statusCode == 404 || e.statusCode == 400 || e.cause is kotlinx.serialization.SerializationException ||
+                e.cause is ClassCastException)
         ) null else throw e
     } catch (e: ClassCastException) {
         null
     } catch (e: kotlinx.serialization.SerializationException) {
+        null
+    } catch (e: IllegalArgumentException) {
+        // A response of another shape than expected, e.g. without stages.
         null
     }
 
@@ -315,12 +414,48 @@ class JenkinsClient(
         return LogChunk(response.body(), next, more)
     }
 
+    /**
+     * The last [maxBytes] of a build's console text, cut at a line start. The log is streamed and
+     * only its end is kept, so a huge log costs time but no memory.
+     */
+    fun logTail(buildUrl: String, maxBytes: Int): String {
+        val response = sendFollowing(request(JenkinsPaths.rebase(baseUrl, buildUrl) + "consoleText").GET().build(), HttpResponse.BodyHandlers.ofInputStream())
+        val code = response.statusCode()
+        if (code !in 200..299) {
+            response.body().close()
+            throw JenkinsException(statusHint(code, response.request().uri()), code)
+        }
+        val gzip = response.headers().firstValue("Content-Encoding").map { it.equals("gzip", true) }.orElse(false)
+        val ring = ByteArray(maxBytes)
+        var total = 0L
+        try {
+            (if (gzip) GZIPInputStream(response.body()) else response.body()).use { input ->
+                val chunk = ByteArray(16 * 1024)
+                while (true) {
+                    val read = input.read(chunk)
+                    if (read < 0) break
+                    for (i in 0 until read) ring[((total + i) % maxBytes).toInt()] = chunk[i]
+                    total += read
+                }
+            }
+        } catch (e: IOException) {
+            throw JenkinsException("Cannot read the log: ${e.message ?: e.javaClass.simpleName}", cause = e)
+        }
+        if (total <= maxBytes) return String(ring, 0, total.toInt(), StandardCharsets.UTF_8)
+        val start = (total % maxBytes).toInt()
+        val text = String(ring.copyOfRange(start, maxBytes) + ring.copyOfRange(0, start), StandardCharsets.UTF_8)
+        // The cut falls into the middle of a line (and maybe of a character).
+        return text.substringAfter('\n', text)
+    }
+
     // ---- http -----------------------------------------------------------------------------
 
     private fun getJson(path: String): JsonObject = getJsonAbsolute(baseUrl + path)
 
+    private fun getText(url: String): String = send(request(url).GET().build()).body()
+
     private fun getJsonAbsolute(url: String): JsonObject {
-        val body = send(request(url).header("Accept", "application/json").GET().build()).body()
+        val body = send(request(url).header("Accept", "application/json").GET().build(), expectJson = true).body()
         return runCatching { json.parseToJsonElement(body) as JsonObject }.getOrElse {
             throw JenkinsException("Response from $url is not JSON - is the URL pointing to Jenkins?", cause = it)
         }
@@ -353,30 +488,67 @@ class JenkinsClient(
         null
     }
 
-    private fun request(url: String): HttpRequest.Builder = HttpRequest.newBuilder(URI.create(url))
-        .timeout(requestTimeout)
-        .header("Authorization", authHeader)
+    /** The API token only goes to the Jenkins itself, never to a host a link or redirect points at. */
+    private fun request(url: String, gzip: Boolean = true): HttpRequest.Builder {
+        val uri = URI.create(url)
+        val builder = HttpRequest.newBuilder(uri).timeout(requestTimeout)
+        if (originOf(uri) == origin) builder.header("Authorization", authHeader)
         // JSON from Jenkins compresses ~10x; the JDK client does not negotiate this on its own.
-        .header("Accept-Encoding", "gzip")
+        if (gzip) builder.header("Accept-Encoding", "gzip")
+        return builder
+    }
 
-    private fun send(request: HttpRequest, acceptStatus: Set<Int> = emptySet()): HttpResponse<String> {
-        val response = try {
-            http.send(request, GzipStringHandler)
-        } catch (e: IOException) {
-            throw JenkinsException("Cannot reach ${request.uri().host}: ${e.message ?: e.javaClass.simpleName}", cause = e)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw JenkinsException("Request interrupted", cause = e)
+    /** Where a redirect response points, null if it is none. */
+    private fun redirectTarget(response: HttpResponse<*>): URI? {
+        if (response.statusCode() !in REDIRECTS) return null
+        return response.headers().firstValue("Location").map { response.request().uri().resolve(it) }.orElse(null)
+    }
+
+    /**
+     * Sends [request]; GET requests follow redirects here instead of in the HTTP client, so that
+     * [request] decides for every hop whether the token is sent along.
+     */
+    private fun <T> sendFollowing(request: HttpRequest, handler: HttpResponse.BodyHandler<T>): HttpResponse<T> {
+        var current = request
+        repeat(MAX_REDIRECTS) {
+            val response = try {
+                http.send(current, handler)
+            } catch (e: IOException) {
+                throw JenkinsException("Cannot reach ${current.uri().host}: ${e.message ?: e.javaClass.simpleName}", cause = e)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw JenkinsException("Request interrupted", cause = e)
+            }
+            val target = redirectTarget(response)?.takeIf { current.method() == "GET" } ?: return response
+            (response.body() as? java.io.Closeable)?.close()
+            val next = request(target.toString())
+            current.headers().firstValue("Accept").ifPresent { next.header("Accept", it) }
+            current = next.GET().build()
         }
+        // Data requests are not redirected in circles; a sign-in in front of Jenkins that does not accept the token is.
+        throw JenkinsException("${request.uri().host} keeps redirecting instead of answering - sign-in needed, check the API token", 401)
+    }
+
+    /**
+     * [expectJson]: an HTML answer is the login page of a proxy or single sign-on in front of
+     * Jenkins, reported as 401 so callers treat it as "sign-in needed" and not as missing data.
+     */
+    private fun send(request: HttpRequest, acceptStatus: Set<Int> = emptySet(), expectJson: Boolean = false): HttpResponse<String> {
+        val response = sendFollowing(request, GzipStringHandler)
         val code = response.statusCode()
-        if (code in 200..399 || code in acceptStatus) return response
-        val hint = when (code) {
-            401 -> "Unauthorized - check user name and API token"
-            403 -> "Forbidden - missing permission"
-            404 -> "Not found: ${request.uri()}"
-            else -> "HTTP $code from ${request.uri()}"
+        val html = response.headers().firstValue("Content-Type").map { it.startsWith("text/html", ignoreCase = true) }.orElse(false)
+        if (expectJson && html && code in 200..299) {
+            throw JenkinsException("${response.request().uri().host} answered with a web page instead of data - sign-in needed, check the API token", 401)
         }
-        throw JenkinsException(hint, code)
+        if (code in 200..399 || code in acceptStatus) return response
+        throw JenkinsException(statusHint(code, request.uri()), code)
+    }
+
+    private fun statusHint(code: Int, uri: URI) = when (code) {
+        401 -> "Unauthorized - check user name and API token"
+        403 -> "Forbidden - missing permission"
+        404 -> "Not found: $uri"
+        else -> "HTTP $code from $uri"
     }
 
     private fun encode(value: String) = URLEncoder.encode(value, StandardCharsets.UTF_8)
@@ -397,9 +569,20 @@ class JenkinsClient(
     }
 
     companion object {
+        private const val MAX_STAGE_STEPS = 200
+        private const val MAX_REDIRECTS = 5
+        private val REDIRECTS = setOf(301, 302, 303, 307, 308)
+        private val BROKEN_STATES = setOf("FAILED", "FAILURE", "UNSTABLE")
+
+        private fun originOf(uri: URI): String {
+            val port = if (uri.port >= 0) uri.port else if (uri.scheme.equals("https", true)) 443 else 80
+            return "${uri.scheme?.lowercase()}://${uri.host?.lowercase()}:$port"
+        }
+
+        /** Redirects are followed by the client itself, see [sendFollowing]. */
         fun defaultHttpClient(configure: HttpClient.Builder.() -> Unit = {}): HttpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(15))
-            .followRedirects(HttpClient.Redirect.NORMAL)
+            .followRedirects(HttpClient.Redirect.NEVER)
             .cookieHandler(CookieManager())
             .apply(configure)
             .build()

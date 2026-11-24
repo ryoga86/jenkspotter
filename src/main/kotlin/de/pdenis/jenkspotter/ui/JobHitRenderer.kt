@@ -5,31 +5,25 @@ import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.JBColor
 import com.intellij.ui.RowIcon
 import com.intellij.ui.SimpleTextAttributes
+import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.UIUtil
 import de.pdenis.jenkspotter.JenkSpotterBundle
 import de.pdenis.jenkspotter.JenkSpotterIcons
-import de.pdenis.jenkspotter.core.ChainNode
-import de.pdenis.jenkspotter.core.ChainPosition
-import de.pdenis.jenkspotter.api.JenkinsPaths
 import de.pdenis.jenkspotter.core.JobHit
 import de.pdenis.jenkspotter.core.JobIndexService
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
-import com.intellij.ui.components.JBLabel
-import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.Component
-import javax.swing.Icon
 import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.ListCellRenderer
-import de.pdenis.jenkspotter.settings.FollowUpIcon
-import de.pdenis.jenkspotter.settings.ChainStepIcon
-import de.pdenis.jenkspotter.settings.ChainDisplay
 
 /**
- * One job of a search result: name with highlighted matches, folder path and, depending on the
- * layout, the Jenkins name in front or after it. Used by the jobs list and the popup. Jobs with
- * follow-up jobs show their count behind the configured mark, the whole chain is in the tooltip.
+ * One job of a search result: icon of its kind, name with highlighted matches, folder path and,
+ * depending on the layout, the Jenkins name in front or after it. Used by the jobs list and the
+ * popup. Behind the name: how many jobs trigger it and how many follow-up jobs it has; a click on
+ * either opens the call graph ([ChainsPopup]).
  */
 class JobHitRenderer(
     /** Where the Jenkins name goes for the current row. */
@@ -43,87 +37,54 @@ class JobHitRenderer(
     /** Path of the folder node the row is listed under; not repeated next to the job. */
     var folderShown: String? = null
 
-    /** [ChainDisplay.TREE]: nesting below the job that triggers it (0 = listed on its own). */
-    var chainDepth: Int = 0
+    /** Branch below its multibranch pipeline: "├" / "└" in front of the icon; null = none. */
+    var connector: Connector? = null
 
-    /** [ChainDisplay.TREE]: true/false = follow-up jobs shown/hidden, null = it has none. */
-    var expanded: Boolean? = null
-
-    /** [ChainDisplay.LANE]: piece of the chain line drawn at the left edge. */
-    var lane: Lane = Lane.NONE
-
-    /** [ChainDisplay.LANE]: the line into / out of this row is dashed (that job is not triggered). */
-    var laneDashedIn: Boolean = false
-    var laneDashedOut: Boolean = false
-
-    /** [ChainDisplay.HIGHLIGHT]: how the row relates to the selected job, null = not at all. */
+    /** How the row relates to the job under the mouse: tinted while hovering, null = not related. */
     var relation: Relation? = null
 
-    enum class Lane { NONE, START, MIDDLE, END }
+    enum class Relation { UPSTREAM, DOWNSTREAM }
 
-    enum class Relation { UPSTREAM, DOWNSTREAM, NOT_TRIGGERED }
+    enum class Connector { MIDDLE, LAST }
 
     // Two text renderers, so none is ever moved between parents: one stands alone, the other
-    // sits permanently in a panel with labels for the step and follow-up icons (text cannot hold icons).
+    // sits permanently in a panel with the badges (text cannot hold icons behind it).
     private val plain = Line()
     private val inBadge = Line()
-    /** "2 <icon>": step of a job triggered by others, number in front. */
-    private val stepBadge = JBLabel().apply {
-        iconTextGap = JBUI.scale(2)
-        border = JBUI.Borders.emptyLeft(6)
-        horizontalTextPosition = javax.swing.SwingConstants.LEFT
-    }
-    /** "<icon> 3": follow-up jobs, number after. */
-    private val badge = JBLabel().apply { iconTextGap = JBUI.scale(2); border = JBUI.Borders.emptyLeft(6) }
-    private val withBadge = JPanel(BorderLayout()).apply {
+    // "2 -> 3": triggered by 2 jobs, triggers 3; either number is left out when it is 0.
+    /** Number of jobs triggering it, right in front of the arrow. */
+    private val upBadge = badgeLabel()
+    /** The arrow, then the number of follow-up jobs. */
+    private val downBadge = badgeLabel().apply { border = JBUI.Borders.emptyLeft(2) }
+    private val withBadge = object : JPanel(BorderLayout()) {
+        override fun getToolTipText(): String? = inBadge.toolTipText
+    }.apply {
         isOpaque = true
         add(inBadge, BorderLayout.WEST)
         // GridBag centers the labels vertically on the text row; FlowLayout pinned them to the top.
         add(JPanel(java.awt.GridBagLayout()).apply {
             isOpaque = false
             val c = java.awt.GridBagConstraints().apply { anchor = java.awt.GridBagConstraints.WEST }
-            add(stepBadge, c)
-            add(badge, c)
+            add(upBadge, c)
+            add(downBadge, c)
             add(javax.swing.Box.createHorizontalGlue(), c.apply { weightx = 1.0; fill = java.awt.GridBagConstraints.HORIZONTAL })
         }, BorderLayout.CENTER)
     }
 
-    override fun getListCellRendererComponent(list: JList<out JobHit>, value: JobHit, index: Int, selected: Boolean, hasFocus: Boolean): Component {
-        val component = badgedComponent(list, value, index, selected, hasFocus)
-        val tint = relation?.takeIf { !selected }?.let {
-            when (it) {
-                Relation.UPSTREAM -> UPSTREAM_TINT
-                Relation.DOWNSTREAM -> DOWNSTREAM_TINT
-                Relation.NOT_TRIGGERED -> NOT_TRIGGERED_TINT
-            }
-        }
-        if (tint != null) {
-            component.background = tint
-            if (component === withBadge) inBadge.background = tint
-        }
-        return component
-    }
+    private fun badgeLabel() = JBLabel().apply { iconTextGap = JBUI.scale(1); border = JBUI.Borders.emptyLeft(8) }
 
-    private fun badgedComponent(list: JList<out JobHit>, value: JobHit, index: Int, selected: Boolean, hasFocus: Boolean): Component {
+    override fun getListCellRendererComponent(list: JList<out JobHit>, value: JobHit, index: Int, selected: Boolean, hasFocus: Boolean): Component {
+        val tint = relation?.takeIf { !selected }?.let { if (it == Relation.UPSTREAM) UPSTREAM_TINT else DOWNSTREAM_TINT }
+        val background = tint ?: Stripes.background(index % 2 == 1, selected, hasFocus)
         val view = JenkSpotterSettings.getInstance().current
-        if (view.chainDisplay != ChainDisplay.BADGES) return plain.getListCellRendererComponent(list, value, index, selected, hasFocus)
-        val icon = JenkSpotterIcons.followUp(view.followUpIcon)
-        val chain = if (icon != null && view.showDownstream && value.job.downstream.isNotEmpty()) {
-            JobIndexService.getInstance().chain(value.serverId, value.job)
-        } else {
-            emptyList()
+        // A lookup: the list computed the badges of its rows before showing them.
+        val badges = JobIndexService.getInstance().badges(value.serverId, value.job)
+        val triggering = if (view.showTriggers) badges.triggeredBy else 0
+        val followUps = if (view.showTriggers) badges.followUps else 0
+        if (triggering == 0 && followUps == 0) {
+            return plain.getListCellRendererComponent(list, value, index, selected, hasFocus).also { it.background = background }
         }
-        val stepIcon = JenkSpotterIcons.chainStep(view.chainStepIcon, view.followUpIcon)
-        val position = if (stepIcon != null && view.showChainStep && !value.job.isFolder) {
-            JobIndexService.getInstance().position(value.serverId, value.job)
-        } else {
-            null
-        }
-        if (chain.isEmpty() && position == null) return plain.getListCellRendererComponent(list, value, index, selected, hasFocus)
         inBadge.getListCellRendererComponent(list, value, index, selected, hasFocus)
-        stepBadge.font = list.font
-        badge.font = list.font
-        val background = UIUtil.getListBackground(selected, hasFocus)
         inBadge.background = background
         withBadge.background = background
         fun color(warn: Boolean) = when {
@@ -131,140 +92,110 @@ class JobHitRenderer(
             warn -> CUT_OFF_COLOR
             else -> UIUtil.getContextHelpForeground()
         }
-        stepBadge.isVisible = position != null
-        if (position != null) {
-            stepBadge.icon = stepIcon
-            stepBadge.text = position.step.toString()
-            stepBadge.foreground = color(position.blockedBy != null)
+        upBadge.isVisible = triggering > 0
+        if (triggering > 0) {
+            upBadge.font = list.font
+            upBadge.text = triggering.toString()
+            upBadge.foreground = color(badges.blocked)
         }
-        badge.isVisible = chain.isNotEmpty()
-        badge.icon = icon
-        badge.text = countText(chain)
-        badge.foreground = color(cutOff(chain))
-        withBadge.toolTipText = inBadge.toolTipText
+        // The arrow stays for jobs only triggered by others: "2 ->" reads as "triggered, triggers nothing".
+        downBadge.font = list.font
+        downBadge.icon = JenkSpotterIcons.FollowUps
+        // "3", or "2/3" when a disabled job keeps one of the 3 follow-up jobs from running.
+        downBadge.text = when {
+            followUps == 0 -> ""
+            badges.activeFollowUps == followUps -> "$followUps"
+            else -> "${badges.activeFollowUps}/$followUps"
+        }
+        downBadge.foreground = color(badges.activeFollowUps < followUps)
+        upBadge.border = JBUI.Borders.emptyLeft(8)
         return withBadge
     }
 
+    /**
+     * Whether [point] (relative to the cell) hits one of the badges of the row just rendered
+     * into [component] with [size].
+     */
+    fun isOnChainsBadge(component: Component, size: java.awt.Dimension, point: java.awt.Point): Boolean {
+        if (component !== withBadge) return false
+        withBadge.setBounds(0, 0, size.width, size.height)
+        fun layout(c: java.awt.Container) {
+            c.doLayout()
+            c.components.filterIsInstance<java.awt.Container>().forEach(::layout)
+        }
+        layout(withBadge)
+        return listOf(upBadge, downBadge).any { it.isVisible && javax.swing.SwingUtilities.convertRectangle(it.parent, it.bounds, withBadge).contains(point) }
+    }
+
     private inner class Line : ColoredListCellRenderer<JobHit>() {
-    private var paintedLane = Lane.NONE
-    private var dashedIn = false
-    private var dashedOut = false
-    /** Disabled or behind a disabled job: hollow dot. */
-    private var hollow = false
+    /** Built only when the tooltip is shown: rendering all rows must stay cheap with thousands of jobs. */
+    private var tooltip: () -> String? = { null }
+    /** Colour of the workflow the job belongs to, painted as a thin strip at the left edge; null = none. */
+    private var workflowColor: java.awt.Color? = null
 
     override fun customizeCellRenderer(list: JList<out JobHit>, value: JobHit, index: Int, selected: Boolean, hasFocus: Boolean) {
         val view = JenkSpotterSettings.getInstance().current
-        val display = view.chainDisplay
-        paintedLane = if (display == ChainDisplay.LANE) lane else Lane.NONE
-        dashedIn = laneDashedIn
-        dashedOut = laneDashedOut
-        hollow = laneDashedIn || value.job.disabled
-        val laneSpace = if (display == ChainDisplay.LANE) LANE_WIDTH else 0
-        ipad = JBUI.insets(1, 2 + indent + chainDepth * CHAIN_INDENT + laneSpace, 1, 2)
+        val badges = JobIndexService.getInstance().badges(value.serverId, value.job)
+        workflowColor = if (view.showWorkflowColors) workflowColor(value.serverId, badges) else null
+        // The connector sits right below the multibranch pipeline's icon, the branch icon after it.
+        val tree = when (connector) {
+            Connector.MIDDLE -> CONNECTOR_MIDDLE
+            Connector.LAST -> CONNECTOR_LAST
+            null -> null
+        }
+        ipad = JBUI.insets(1, 2 + indent, 1, 2)
         val disabled = value.job.disabled
-        val base = (if (value.job.isFolder) JenkSpotterIcons.Folder else JenkSpotterIcons.job(view.jobIcon, value.job.isParameterized))
-            ?.let { if (disabled) IconLoader.getDisabledIcon(it) else it }
+        val type = JenkSpotterIcons.jobType(value.job, badges.inMultiBranch)
+        val base = JenkSpotterIcons.job(type, value.job.isParameterized).let { if (disabled) IconLoader.getDisabledIcon(it) else it }
         val marks = listOfNotNull(JenkSpotterIcons.Pinned.takeIf { value.pinned }, JenkSpotterIcons.Watched.takeIf { value.watched })
-        // Tree: an expand arrow in front, or the same space for jobs without follow-ups.
-        val arrow = if (display != ChainDisplay.TREE) {
-            null
-        } else {
-            when (expanded) {
-                true -> UIUtil.getTreeExpandedIcon()
-                false -> UIUtil.getTreeCollapsedIcon()
-                null -> com.intellij.util.ui.EmptyIcon.create(UIUtil.getTreeCollapsedIcon())
-            }
-        }
-        val icons = listOfNotNull(arrow, base) + marks
-        icon = when (icons.size) {
-            0 -> null
-            1 -> icons.single()
-            else -> RowIcon(*icons.toTypedArray())
-        }
-        val upstream = display != ChainDisplay.BADGES || view.showChainStep
-        val position = if (upstream && !value.job.isFolder) JobIndexService.getInstance().position(value.serverId, value.job) else null
-        if (display == ChainDisplay.TREE && chainDepth > 0) append("\u2514 ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-        if (display == ChainDisplay.ARROWS && position != null) {
-            append("\u25C2 ", if (position.blockedBy != null) SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, CUT_OFF_COLOR) else SimpleTextAttributes.GRAYED_ATTRIBUTES)
-        }
+        val icons = listOfNotNull(tree, base) + marks
+        icon = if (icons.size == 1) base else RowIcon(*icons.toTypedArray())
         val server = JenkSpotterSettings.getInstance().server(value.serverId)?.displayName.orEmpty()
         val label = serverLabel()
         if (label == ServerLabel.PREFIX) {
             appendHighlighted(server, value.match.serverRanges, SimpleTextAttributes.GRAYED_ATTRIBUTES, selected)
             append("  ›  ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
         }
-        appendHighlighted(value.name, value.match.nameRanges, if (disabled) DISABLED_NAME else SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES, selected)
-        if (display == ChainDisplay.ARROWS && value.job.downstream.isNotEmpty()) append(" \u25B8", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-        if (disabled) {
-            append("  " + JenkSpotterBundle.message("jobs.disabled"), SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)
-        } else if (display != ChainDisplay.BADGES && position?.blockedBy != null) {
-            // Badges show this in orange; the other displays say it in words.
-            append("  " + JenkSpotterBundle.message("jobs.notReached"), SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, CUT_OFF_COLOR))
+        // A branch alone ("main") does not say which repository it builds: its multibranch pipeline goes in front,
+        // unless the row sits right below that pipeline's node.
+        if (type == JenkSpotterIcons.JobType.BRANCH && value.path != folderShown) {
+            val pipeline = de.pdenis.jenkspotter.api.JenkinsPaths.displayName(value.job.fullName.substringBeforeLast('/').substringAfterLast('/'))
+            append(pipeline, if (disabled) SimpleTextAttributes.GRAYED_ATTRIBUTES else SimpleTextAttributes.REGULAR_ATTRIBUTES)
+            append(" \u203A ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
         }
+        appendHighlighted(value.name, value.match.nameRanges, if (disabled) DISABLED_NAME else SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES, selected)
+        if (disabled) append("  " + JenkSpotterBundle.message("jobs.disabled"), SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)
         if (view.showJobPath && value.path.isNotEmpty() && value.path != folderShown) {
             append("   ")
             appendHighlighted(value.path, value.match.pathRanges, SimpleTextAttributes.GRAYED_ATTRIBUTES, selected)
-        }
-        if (display == ChainDisplay.BADGES && position != null && view.chainStepIcon == ChainStepIcon.TEXT) {
-            val color = if (position.blockedBy != null) CUT_OFF_COLOR else UIUtil.getContextHelpForeground()
-            append("   " + JenkSpotterBundle.message("jobs.chainStep", position.step, position.length), SimpleTextAttributes(SimpleTextAttributes.STYLE_SMALLER, color))
         }
         if (label == ServerLabel.SUFFIX) {
             append("   ")
             appendHighlighted(server, value.match.serverRanges, SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES, selected)
         }
-        val chain = if ((display != ChainDisplay.BADGES || view.showDownstream) && value.job.downstream.isNotEmpty()) {
-            JobIndexService.getInstance().chain(value.serverId, value.job)
-        } else {
-            emptyList()
-        }
-        val tips = mutableListOf<String>()
-        if (disabled) tips += "<b>" + JenkSpotterBundle.message("jobs.disabled.tooltip") + "</b>"
-        if (value.job.isParameterized) tips += JenkSpotterBundle.message("jobs.parameters", value.job.parameterCount)
-        if (value.watched) tips += JenkSpotterBundle.message("jobs.watched")
-        if (position != null) tips += positionTooltip(value.serverId, position)
-        if (chain.isNotEmpty()) {
-            if (display == ChainDisplay.BADGES && view.followUpIcon == FollowUpIcon.ARROW) {
-                val attributes = if (cutOff(chain)) SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, CUT_OFF_COLOR) else SimpleTextAttributes.GRAYED_ATTRIBUTES
-                append("   \u2192 " + countText(chain), attributes)
-            }
-            tips += chainTooltip(chain)
-        }
-        toolTipText = if (tips.isEmpty()) null else "<html>" + tips.joinToString("<br>") + "</html>"
+        tooltip = { tooltipHtml(value, type, badges) }
     }
 
-    /** Chain line: a dot per job, joined to the rows above and below it within the chain. */
+    override fun getToolTipText(): String? = tooltip()
+
     override fun paintComponent(g: java.awt.Graphics) {
         super.paintComponent(g)
-        if (paintedLane == Lane.NONE) return
-        val g2 = g.create() as java.awt.Graphics2D
-        try {
-            g2.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING, java.awt.RenderingHints.VALUE_ANTIALIAS_ON)
-            val x = JBUI.scale(2 + indent + LANE_WIDTH / 2)
-            val mid = height / 2
-            val solid = java.awt.BasicStroke(JBUI.scale(2f))
-            val dashed = java.awt.BasicStroke(JBUI.scale(1.5f), java.awt.BasicStroke.CAP_BUTT, java.awt.BasicStroke.JOIN_MITER, 10f, floatArrayOf(JBUI.scale(3f), JBUI.scale(3f)), 0f)
-            fun segment(y1: Int, y2: Int, isDashed: Boolean) {
-                g2.color = if (isDashed) CUT_OFF_COLOR else LANE_COLOR
-                g2.stroke = if (isDashed) dashed else solid
-                g2.drawLine(x, y1, x, y2)
-            }
-            if (paintedLane != Lane.START) segment(0, mid, dashedIn)
-            if (paintedLane != Lane.END) segment(mid, height, dashedOut)
-            val r = JBUI.scale(3)
-            if (hollow) {
-                g2.color = UIUtil.getListBackground()
-                g2.fillOval(x - r, mid - r, 2 * r, 2 * r)
-                g2.color = CUT_OFF_COLOR
-                g2.stroke = java.awt.BasicStroke(JBUI.scale(1.5f))
-                g2.drawOval(x - r, mid - r, 2 * r, 2 * r)
-            } else {
-                g2.color = LANE_COLOR
-                g2.fillOval(x - r, mid - r, 2 * r, 2 * r)
-            }
-        } finally {
-            g2.dispose()
-        }
+        val color = workflowColor ?: return
+        g.color = color
+        g.fillRect(0, 0, JBUI.scale(WORKFLOW_STRIP), height)
+    }
+
+    private fun tooltipHtml(value: JobHit, type: JenkSpotterIcons.JobType, badges: de.pdenis.jenkspotter.core.JobBadges): String {
+        val tips = mutableListOf("<b>" + JenkSpotterBundle.message(type.key) + "</b>")
+        if (value.job.disabled) tips += "<b>" + JenkSpotterBundle.message("jobs.disabled.tooltip") + "</b>"
+        if (value.job.isParameterized) tips += JenkSpotterBundle.message("jobs.parameters", value.job.parameterCount)
+        if (value.watched) tips += JenkSpotterBundle.message("jobs.watched")
+        val triggering = badges.triggeredBy
+        if (triggering > 0) tips += JenkSpotterBundle.message("jobs.triggeredBy", triggering)
+        if (value.job.downstream.isNotEmpty()) tips += JenkSpotterBundle.message("jobs.followUps", value.job.downstream.size)
+        // The graph itself is in [ChainsPopup]; the tooltip only says how to open it.
+        if (triggering > 0 || value.job.downstream.isNotEmpty()) tips += "<i>" + JenkSpotterBundle.message("jobs.chains.badge.tooltip") + "</i>"
+        return "<html>" + tips.joinToString("<br>") + "</html>"
     }
 
     private fun appendHighlighted(text: String, ranges: List<IntRange>, plain: SimpleTextAttributes, selected: Boolean) {
@@ -286,45 +217,54 @@ class JobHitRenderer(
 
     }
 
+    /** "├─" or "└─", over the full row height so consecutive rows join into one line. */
+    private class ConnectorIcon(private val kind: Connector) : javax.swing.Icon {
+        override fun paintIcon(c: Component?, g: java.awt.Graphics, x: Int, y: Int) {
+            val g2 = g.create() as java.awt.Graphics2D
+            try {
+                g2.color = UIUtil.getContextHelpForeground()
+                val cx = x + JBUI.scale(CONNECTOR_WIDTH) / 2
+                val cy = y + iconHeight / 2
+                // Over the whole cell height, so the lines of consecutive rows join.
+                val top = 0
+                val bottom = if (kind == Connector.LAST) cy else c?.height ?: (y + iconHeight)
+                g2.drawLine(cx, top, cx, bottom)
+                g2.drawLine(cx, cy, x + JBUI.scale(CONNECTOR_WIDTH) - JBUI.scale(2), cy)
+            } finally {
+                g2.dispose()
+            }
+        }
+
+        override fun getIconWidth() = JBUI.scale(CONNECTOR_WIDTH)
+        override fun getIconHeight() = JBUI.scale(16)
+    }
+
     companion object {
+        private const val CONNECTOR_WIDTH = 14
+        private const val WORKFLOW_STRIP = 3
+        private val UPSTREAM_TINT = JBColor(0xE3ECFA, 0x2C3A50)
+        private val DOWNSTREAM_TINT = JBColor(0xE3F3E1, 0x2D4230)
+
+        /** Muted colours that stay apart from each other and from the selection, in light and dark themes. */
+        private val WORKFLOW_COLORS = listOf(
+            JBColor(0x5B8DEF, 0x4A73C2), JBColor(0x4CAF7D, 0x3F9168), JBColor(0xE0A030, 0xB8862E),
+            JBColor(0xB76AD9, 0x9558B0), JBColor(0xE06C75, 0xB85A62), JBColor(0x3FB5C0, 0x35939C),
+            JBColor(0x9C8B5E, 0x82744F), JBColor(0xD97FB5, 0xB06A93),
+        )
+
+        /**
+         * Jobs of one workflow (the same job starting it) share a colour, chosen from its name so it
+         * stays the same; jobs in no workflow have none.
+         */
+        fun workflowColor(serverId: String, badges: de.pdenis.jenkspotter.core.JobBadges): java.awt.Color? {
+            val root = badges.workflow ?: return null
+            return WORKFLOW_COLORS[Math.floorMod((serverId + root).hashCode(), WORKFLOW_COLORS.size)]
+        }
+
+        private val CONNECTOR_MIDDLE = ConnectorIcon(Connector.MIDDLE)
+        private val CONNECTOR_LAST = ConnectorIcon(Connector.LAST)
         private val MATCH_COLOR = JBColor.namedColor("JenkSpotter.matchForeground", JBColor(0xC25A0A, 0xE08855))
-        private val CUT_OFF_COLOR = JBColor(0xB07800, 0xD9A343)
-        private val LANE_COLOR = JBColor(0x6E9BD8, 0x5C7FB0)
-        private val UPSTREAM_TINT = JBColor(0xE6EEFA, 0x2E3B4F)
-        private val DOWNSTREAM_TINT = JBColor(0xE5F3E3, 0x2F4231)
-        private val NOT_TRIGGERED_TINT = JBColor(0xF6EEDC, 0x46402F)
-        private const val LANE_WIDTH = 14
-        private const val CHAIN_INDENT = 16
+        val CUT_OFF_COLOR = JBColor(0xB07800, 0xD9A343)
         private val DISABLED_NAME = SimpleTextAttributes(SimpleTextAttributes.STYLE_STRIKEOUT, UIUtil.getInactiveTextColor())
-
-        /** Some follow-up jobs will not run because a job of the chain is disabled. */
-        fun cutOff(chain: List<ChainNode>) = chain.sumOf { it.activeSize } < chain.sumOf { it.size }
-
-        /** "3", or "2/3" when only 2 of the 3 follow-up jobs will run. */
-        fun countText(chain: List<ChainNode>): String {
-            val total = chain.sumOf { it.size }
-            val active = chain.sumOf { it.activeSize }
-            return if (active == total) "$total" else "$active/$total"
-        }
-
-        /** "Step 2 of 4 in the chain started by build:" and the whole chain with this job in bold. */
-        fun positionTooltip(serverId: String, position: ChainPosition): String {
-            val e = com.intellij.openapi.util.text.StringUtil::escapeXmlEntities
-            val root = position.path.first()
-            val out = StringBuilder(JenkSpotterBundle.message("jobs.chainStep.tooltip", position.step, position.length, e(JenkinsPaths.displayName(root.fullName))))
-            position.blockedBy?.let { out.append("<br><font color='#").append(com.intellij.ui.ColorUtil.toHex(CUT_OFF_COLOR)).append("'>")
-                .append(e(JenkSpotterBundle.message("jobs.chainStep.blocked", JenkinsPaths.displayName(it.fullName)))).append("</font>") }
-            out.append("<br>").append(e(JenkinsPaths.displayName(root.fullName)))
-            out.append(JobInfoDialog.chainHtml(JobIndexService.getInstance().chain(serverId, root), highlight = position.job.fullName))
-            return out.toString()
-        }
-
-        /** Indented tree of the whole chain (HTML fragment). */
-        fun chainTooltip(chain: List<ChainNode>): String {
-            val total = chain.sumOf { it.size }
-            val active = chain.sumOf { it.activeSize }
-            val head = if (active == total) JenkSpotterBundle.message("jobs.chain", total) else JenkSpotterBundle.message("jobs.chain.cutOff", active, total)
-            return head + JobInfoDialog.chainHtml(chain)
-        }
     }
 }

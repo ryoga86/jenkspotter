@@ -49,6 +49,29 @@ class JenkinsClientTest {
     }
 
     @Test
+    fun `stageLog fetches the steps of a stage with their plain-text logs`() {
+        handler = { ex ->
+            when (ex.requestURI.path) {
+                "/job/app/7/execution/node/4/wfapi/describe" -> respond(ex, 200, """{"id":"4","name":"Build","stageFlowNodes":[
+                    {"id":"7","name":"Shell Script","parameterDescription":"make all","status":"SUCCESS"},
+                    {"id":"8","name":"Print Message","parameterDescription":"done","status":"FAILED"}]}""")
+                "/job/app/7/execution/node/7/wfapi/log" -> respond(ex, 200, """{"nodeId":"7","hasMore":true,"text":"+ make all\n<span class=\"x\">a &lt;b&gt; &amp; c</span>\n"}""")
+                "/job/app/7/execution/node/8/wfapi/log" -> respond(ex, 404, "")
+                else -> respond(ex, 404, "")
+            }
+        }
+        val steps = client().stageLog("$foreignRoot" + "job/app/7/", Stage("4", "Build", "SUCCESS", 0, 0, 0))!!
+        assertEquals(listOf("Shell Script", "Print Message"), steps.map { it.name })
+        assertEquals("make all", steps[0].description)
+        assertEquals("+ make all\na <b> & c\n", steps[0].log)
+        assertTrue(steps[0].truncated)
+        // A step without a log does not fail the whole stage.
+        assertEquals("", steps[1].log)
+        assertEquals("FAILED", steps[1].status)
+        assertEquals(null, client().stageLog("$foreignRoot" + "job/app/7/", Stage("99", "None", "SUCCESS", 0, 0, 0)))
+    }
+
+    @Test
     fun `whoAmI returns user and rejects wrong token`() {
         handler = { respond(it, 200, """{"id":"alice","fullName":"Alice A."}""") }
         assertEquals(JenkinsUser("alice", "Alice A."), client().whoAmI())
@@ -161,5 +184,107 @@ class JenkinsClientTest {
         assertEquals("false", defs[0].defaultValue)
         assertEquals(listOf("dev", "prod"), defs[1].choices)
         assertEquals(null, defs[3].description)
+    }
+
+    @Test
+    fun `log tail keeps only the end of the log, cut at a line start`() {
+        val log = (1..2000).joinToString("") { "line $it\n" }
+        handler = { respond(it, 200, log) }
+        val tail = client().logTail("$base/job/app/3/", 100)
+        assertTrue(tail.length <= 100)
+        assertTrue(tail.endsWith("line 1999\nline 2000\n"))
+        assertTrue(tail.startsWith("line "))
+        assertTrue(requests.single().endsWith("/job/app/3/consoleText"))
+        // A log shorter than the limit comes back whole.
+        assertEquals(log, client().logTail("$base/job/app/3/", 1_000_000))
+    }
+
+    @Test
+    fun `a login page instead of JSON is reported as sign-in needed, also for optional data`() {
+        handler = { respond(it, 200, "<html><body>Sign in</body></html>", mapOf("Content-Type" to "text/html;charset=utf-8")) }
+        val whoAmI = runCatching { client().whoAmI() }.exceptionOrNull() as JenkinsException
+        assertEquals(401, whoAmI.statusCode)
+        // Stages are optional (plugin may be missing), but a login page must not look like "no stages".
+        val stages = runCatching { client().stages("$base/job/app/3/") }.exceptionOrNull() as JenkinsException
+        assertEquals(401, stages.statusCode)
+    }
+
+    @Test
+    fun `redirects are followed, but the token is not sent to another host`() {
+        var foreignAuth: String? = "not asked"
+        val other = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        other.createContext("/") { ex ->
+            foreignAuth = ex.requestHeaders.getFirst("Authorization")
+            respond(ex, 200, """{"id":"mallory"}""")
+        }
+        other.start()
+        try {
+            handler = { ex ->
+                when (ex.requestURI.path) {
+                    "/me/api/json" -> respond(ex, 302, "", mapOf("Location" to "/moved/api/json"))
+                    "/moved/api/json" -> respond(ex, 200, """{"id":"alice","fullName":"Alice"}""")
+                    else -> respond(ex, 302, "", mapOf("Location" to "http://127.0.0.1:${other.address.port}/login"))
+                }
+            }
+            // Same host: followed with the token (the test server answers 401 without it).
+            assertEquals("alice", client().whoAmI().id)
+            // Other host: followed, without the token.
+            client().queueItem("$base/queue/item/42/")
+            assertEquals(null, foreignAuth)
+        } finally {
+            other.stop(0)
+        }
+    }
+
+    @Test
+    fun `stage log falls back to Stage View when a build has no graph data`() {
+        handler = { ex ->
+            when (ex.requestURI.path) {
+                "/job/app/7/execution/node/4/wfapi/describe" -> respond(ex, 200, """{"id":"4","name":"Build","stageFlowNodes":[
+                    {"id":"5","name":"Shell Script","status":"SUCCESS","parameterDescription":"make"},
+                    {"id":"6","name":"Shell Script","status":"FAILED","parameterDescription":"make test"}]}""")
+                "/job/app/7/execution/node/6/wfapi/log" -> respond(ex, 200, """{"text":"boom\n","hasMore":false}""")
+                else -> respond(ex, 404, "")
+            }
+        }
+        // Only the failed step is fetched when asked for the broken ones.
+        val steps = client().stageLog("$base/job/app/7/", Stage("4", "Build", "FAILED", 0, 0, 0), failedOnly = true, limit = 5)!!
+        assertEquals(listOf("6"), steps.map { it.id })
+        assertTrue(requests.none { it.contains("/node/5/wfapi/log") })
+    }
+
+    @Test
+    fun `recent build refs are collected from jobs in nested folders`() {
+        handler = {
+            respond(it, 200, """{"jobs":[
+                {"builds":[{"url":"${foreignRoot}job/a/2/","timestamp":20,"building":true},{"url":"${foreignRoot}job/a/1/","timestamp":10,"building":false}]},
+                {"jobs":[{"builds":[{"url":"${foreignRoot}job/team/job/b/5/","timestamp":15,"building":false}]},{"jobs":[]}]}]}""")
+        }
+        val refs = client().recentBuildRefs(2)
+        assertEquals(listOf(BuildRef("$base/job/a/2/", 20, true), BuildRef("$base/job/a/1/", 10, false), BuildRef("$base/job/team/job/b/5/", 15, false)), refs)
+        assertTrue(URLDecoder.decode(requests.single(), StandardCharsets.UTF_8).contains("builds[url,timestamp,building]{0,2}"))
+    }
+
+    @Test
+    fun `a redirect loop is reported as sign-in needed`() {
+        handler = { respond(it, 302, "", mapOf("Location" to "/login?from=" + it.requestURI.path.length)) }
+        val error = runCatching { client().whoAmI() }.exceptionOrNull() as JenkinsException
+        assertEquals(401, error.statusCode)
+        assertTrue(requests.size <= 6)
+    }
+
+    @Test
+    fun `resetting the session drops the cookie that pins requests to one node`() {
+        val cookies = mutableListOf<String?>()
+        handler = { ex ->
+            cookies += ex.requestHeaders.getFirst("Cookie")
+            respond(ex, 200, """{"id":"alice"}""", mapOf("Set-Cookie" to "route=node-7; Path=/"))
+        }
+        val client = client()
+        client.whoAmI()
+        client.whoAmI()
+        client.resetSession()
+        client.whoAmI()
+        assertEquals(listOf(null, "route=node-7", null), cookies)
     }
 }
