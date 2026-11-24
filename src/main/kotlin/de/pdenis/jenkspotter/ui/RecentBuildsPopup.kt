@@ -96,8 +96,8 @@ object RecentBuildsPopup {
         return popup
     }
 
-    /** Result icon, number, start, duration, first cause. */
-    private class Renderer : ColoredListCellRenderer<BuildInfo>() {
+    /** Result icon, number, start, duration, first cause. Also used by the build info. */
+    class Renderer : ColoredListCellRenderer<BuildInfo>() {
         override fun customizeCellRenderer(list: JList<out BuildInfo>, value: BuildInfo, index: Int, selected: Boolean, hasFocus: Boolean) {
             icon = JenkSpotterIcons.forResult(value.result)
             append("#${value.number}", SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)

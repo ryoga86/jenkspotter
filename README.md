@@ -40,7 +40,6 @@ jobs in folders and multibranch pipelines, several servers, and a lot of builds 
   parameters, tests, description)
 - **Network friendly**: gzip, compact requests, polling intervals that follow the estimated duration of running
   builds and slow down while the IDE is in the background
-- **Wizarding Mode** (off by default): Harry Potter flavoured texts and a Howler sound for failed builds
 
 ## Usage
 
@@ -56,10 +55,12 @@ Optional Jenkins plugins that unlock more details: *Pipeline: Stage View* (stage
 
 ## Installation
 
-Download the ZIP from [Releases](https://github.com/ryoga86/jenkspotter/releases) (or build it yourself, see below) and
-use *Settings | Plugins | ⚙ | Install Plugin from Disk…*.
+- **JetBrains Marketplace**: in the IDE, *Settings | Plugins | Marketplace*, search for **JenkSpotter**
+- **Manually**: download the ZIP from [Releases](https://github.com/ryoga86/jenkspotter/releases) (or build it
+  yourself, see below) and use *Settings | Plugins | ⚙ | Install Plugin from Disk…*
 
-Requires IntelliJ Platform **2025.1** or newer and the bundled Git plugin.
+Requires IntelliJ Platform **2025.1** or newer and the bundled Git plugin, so it can be installed in every
+IntelliJ-based IDE that ships with Git support (IntelliJ IDEA, PyCharm, WebStorm, GoLand, PhpStorm, RubyMine, …).
 
 ## Privacy
 
@@ -76,8 +77,10 @@ Requirements: JDK 21. Everything else is downloaded by Gradle.
 ./gradlew check          # unit tests + headless IDE tests
 ./gradlew runIde         # start a sandbox IDE with the plugin
 ./gradlew buildPlugin    # -> build/distributions/JenkSpotter-<version>.zip
-./gradlew verifyPlugin   # IntelliJ Plugin Verifier against 2025.1, 2025.2, 2025.3 and 2026.2
+./gradlew verifyPlugin   # IntelliJ Plugin Verifier against 2025.1, 2025.2, 2025.3, 2026.2, 2026.3 and the latest EAP
 ```
+
+`-PbuildSearchableOptions=false` speeds up local builds.
 
 Install the built plugin into your own IDE: put the plugins folder of your IDE into the git-ignored
 `local.properties` and run `./gradlew installToIde`, then restart the IDE:
@@ -115,6 +118,17 @@ the tests use; its password and API token are in `docker/.env`. Remove everythin
 | `docker/` | local test Jenkins |
 | `tools/` | generators for the icons (`generate_icons.py`) and sounds (`generate_sounds.py`) |
 | `art/` | the original Jenkins logo the plugin icons are derived from |
+
+The plugin is compiled against 2025.2; the oldest supported line (2025.1) is covered by the plugin verifier. Releases
+are described in [RELEASING.md](RELEASING.md).
+
+## Support
+
+JenkSpotter is free and open source. If it saves you time, I'd be happy about a coffee:
+
+<a href="https://ko-fi.com/ryoga86"><img src="https://storage.ko-fi.com/cdn/kofi5.png?v=6" alt="Buy me a coffee at ko-fi.com" height="36"></a>
+
+Bugs and ideas: [GitHub issues](https://github.com/ryoga86/jenkspotter/issues)
 
 ## License
 

@@ -102,7 +102,6 @@ class JobSearchPopup private constructor(private val project: Project) : JPanel(
         val query = search.text
         popup?.cancel()
         if (build && hit.job.canBuild) {
-            JenkSpotterSettings.getInstance().markRecent(hit.serverId, hit.job.url)
             BuildActions.trigger(project, hit.serverId, hit.job.url, hit.job.fullName, null)
         } else {
             JobNavigator.reveal(project, hit.serverId, hit.job.url, query)

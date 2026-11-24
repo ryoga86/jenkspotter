@@ -6,7 +6,7 @@ src/main/resources/META-INF/pluginIcon.svg and pluginIcon_dark.svg are derived f
 logo (art/jenkins-original.svg) created by Charles Lowell and Frontside for the Jenkins project,
 https://jenkins.io/. The original and the derived icons are licensed under the Creative Commons
 Attribution-ShareAlike 3.0 Unported License, https://creativecommons.org/licenses/by-sa/3.0/.
-Changes: recoloured, hair, round glasses and lightning scar added (tools/generate_icons.py).
+Changes: background recoloured, magnifying glass added (tools/generate_icons.py).
 
 The 16px icons in src/main/resources/icons are simplified drawings in the same style and are
 distributed under the same licence.

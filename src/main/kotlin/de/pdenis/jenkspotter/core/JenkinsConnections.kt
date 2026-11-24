@@ -15,14 +15,14 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** Hands out one [JenkinsClient] per configured server; rebuilt whenever settings change. */
 @Service(Service.Level.APP)
-class JenkinsConnections {
+class JenkinsConnections : com.intellij.openapi.Disposable {
     private data class Entry(val fingerprint: String, val client: JenkinsClient)
 
     private val clients = ConcurrentHashMap<String, Entry>()
     private val tokens = ConcurrentHashMap<String, String>()
 
     init {
-        ApplicationManager.getApplication().messageBus.connect()
+        ApplicationManager.getApplication().messageBus.connect(this)
             .subscribe(SettingsListener.TOPIC, SettingsListener {
                 // Clients are cached by URL/user/token fingerprint; drop the ones of removed servers.
                 val ids = JenkSpotterSettings.getInstance().current.servers.map { it.id }.toSet()
@@ -42,6 +42,13 @@ class JenkinsConnections {
     }
 
     fun client(serverId: String): JenkinsClient? = JenkSpotterSettings.getInstance().server(serverId)?.let(::client)
+
+    override fun dispose() = Unit
+
+    /** Forgets the cookies of a server's client, e.g. a sticky session to a Jenkins node that went away. */
+    fun resetSessions(serverId: String) {
+        clients[serverId]?.client?.resetSession()
+    }
 
     fun invalidate() {
         clients.clear()

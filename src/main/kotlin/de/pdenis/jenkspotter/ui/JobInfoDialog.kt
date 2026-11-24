@@ -29,8 +29,11 @@ class JobInfoDialog(project: Project, private val hit: JobHit) : DialogWrapper(p
         isEditable = false
         addHyperlinkListener { if (it.eventType == HyperlinkEvent.EventType.ACTIVATED) BuildActions.openInBrowser(it.url.toString()) }
     }
+    @Volatile
     private var parameters: List<ParameterDefinition>? = null
+    @Volatile
     private var builds: List<BuildInfo>? = null
+    @Volatile
     private var error: String? = null
 
     init {
@@ -51,8 +54,9 @@ class JobInfoDialog(project: Project, private val hit: JobHit) : DialogWrapper(p
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
                 val client = JenkinsConnections.getInstance().client(hit.serverId)
-                parameters = client?.parameterDefinitions(hit.job.url)
-                builds = client?.recentBuilds(hit.job.url, 5)
+                    ?: throw de.pdenis.jenkspotter.api.JenkinsException(JenkSpotterBundle.message("error.noToken"))
+                parameters = client.parameterDefinitions(hit.job.url)
+                builds = client.recentBuilds(hit.job.url, 5)
             } catch (e: Exception) {
                 error = e.message ?: e.javaClass.simpleName
             }
@@ -113,14 +117,17 @@ class JobInfoDialog(project: Project, private val hit: JobHit) : DialogWrapper(p
     }
 
     companion object {
-        /** Indented follow-up tree as HTML. */
-        /** [highlight]: full name of a job shown in bold (the one the tooltip is about). */
-        fun chainHtml(chain: List<ChainNode>, highlight: String? = null): String {
+        /**
+         * Indented follow-up tree as HTML. [highlight]: full name of a job shown in bold (the one the
+         * tooltip is about). With [links] every known job is a link to [jobLink] of its full name.
+         */
+        fun chainHtml(chain: List<ChainNode>, highlight: String? = null, links: Boolean = false): String {
             val out = StringBuilder()
             // Disabled jobs are struck through; everything below them is greyed, it is never triggered.
             fun walk(nodes: List<ChainNode>, depth: Int, reached: Boolean) {
                 for (node in nodes) {
-                    val name = StringUtil.escapeXmlEntities(JenkinsPaths.displayName(node.fullName))
+                    val text = StringUtil.escapeXmlEntities(JenkinsPaths.displayName(node.fullName))
+                    val name = if (links && node.url != null) "<a href='${jobLink(node.fullName)}'>$text</a>" else text
                     out.append("<br>").append("&nbsp;&nbsp;&nbsp;&nbsp;".repeat(depth)).append("&#8627; ")
                     when {
                         node.disabled -> out.append("<s>").append(name).append("</s> <i>").append(JenkSpotterBundle.message("jobs.disabled")).append("</i>")
@@ -134,5 +141,11 @@ class JobInfoDialog(project: Project, private val hit: JobHit) : DialogWrapper(p
             walk(chain, 0, true)
             return out.toString()
         }
+
+        /** Link target for a job in [chainHtml]; [jobFromLink] reads it back. */
+        fun jobLink(fullName: String) = "job:" + StringUtil.escapeXmlEntities(java.net.URLEncoder.encode(fullName, Charsets.UTF_8))
+
+        fun jobFromLink(description: String?): String? =
+            description?.takeIf { it.startsWith("job:") }?.let { java.net.URLDecoder.decode(it.removePrefix("job:"), Charsets.UTF_8) }
     }
 }

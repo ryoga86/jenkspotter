@@ -15,7 +15,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
@@ -45,6 +47,12 @@ class BuildMonitorService(private val cs: CoroutineScope) {
     private val lastLoggedError = ConcurrentHashMap<String, String>()
     private val inputs = ConcurrentHashMap<String, de.pdenis.jenkspotter.api.PendingInput>()
     private val lastInputCheck = ConcurrentHashMap<String, Long>()
+
+    /** Servers whose "all builds" history still has builds to fetch, see [pollHistory]. */
+    private val historyPending = ConcurrentHashMap.newKeySet<String>()
+
+    /** "serverId url" of history builds that could not be fetched -> when; not asked again for a while. */
+    private val historyFailed = ConcurrentHashMap<String, Long>()
 
     /** Multibranch jobs of the branches checked out in open projects (project key -> server + job). */
     private val branchJobs = ConcurrentHashMap<String, List<Pair<String, de.pdenis.jenkspotter.api.JobRef>>>()
@@ -89,14 +97,14 @@ class BuildMonitorService(private val cs: CoroutineScope) {
     /** Called by [de.pdenis.jenkspotter.ui.BranchJobs] when the checked-out branch of a project changes. */
     fun setBranchJobs(projectKey: String, jobs: List<Pair<String, de.pdenis.jenkspotter.api.JobRef>>) {
         val previous = branchJobs.put(projectKey, jobs)
-        if (previous != jobs) refresh()
+        // Only the jobs matter: a project without branch jobs, or one whose jobs were merely re-read, needs no poll.
+        fun urls(list: List<Pair<String, de.pdenis.jenkspotter.api.JobRef>>?) = list.orEmpty().map { it.first to it.second.url }.toSet()
+        if (urls(previous) != urls(jobs)) refresh()
     }
 
     fun removeBranchJobs(projectKey: String) {
         branchJobs.remove(projectKey)
     }
-
-    fun branchJobUrls(projectKey: String): Set<String> = branchJobs[projectKey].orEmpty().map { it.second.url }.toSet()
 
     /** The input step was answered from the IDE; stop showing it right away. */
     fun inputHandled(build: TrackedBuild) {
@@ -135,27 +143,53 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         publish()
     }
 
+    /** Step errors of one poll; [forbidden]: a step was refused, so the sign-in is checked again next time. */
+    private class PollErrors : ArrayList<String>() {
+        var forbidden = false
+        /** A step got a 5xx answer. */
+        var serverError = false
+    }
+
     private suspend fun pollLoop(serverId: String, wake: Channel<Boolean>) {
+        // The loop's own job: after restart() cancelled it, a poll still in flight must not write any more.
+        val job = currentCoroutineContext().job
         var failures = 0
         var lastSlowPoll = 0L
+        var lastHistoryPoll = 0L
+        var historyCount = -1
         var userId: String? = null
+        var loggedUser: String? = null
         var forceSlow = true
-        while (cs.isActive) {
+        while (job.isActive) {
             val server = JenkSpotterSettings.getInstance().server(serverId)?.takeIf { it.enabled } ?: return
-            val errors = mutableListOf<String>()
+            val errors = PollErrors()
             var unreachable = false
+            // Only a poll that failed as a whole backs off; a failing step (e.g. the queue answering
+            // 503 once) keeps the normal rhythm, so the light turns green again on the next poll.
+            var pollFailed = false
             try {
                 val client = JenkinsConnections.getInstance().client(server)
                     ?: throw JenkinsException("No API token configured")
                 if (userId == null) {
                     userId = client.whoAmI().id
-                    thisLogger().info("JenkSpotter: ${server.displayName} authenticated as '$userId'")
+                    // Asked again after refused steps; only a new answer is worth a log line.
+                    if (userId != loggedUser) thisLogger().info("JenkSpotter: ${server.displayName} authenticated as '$userId'")
+                    loggedUser = userId
                 }
                 val now = System.currentTimeMillis()
-                pollFast(server, client, userId, errors)
+                pollFast(job, server, client, userId, errors)
                 if (forceSlow || now - lastSlowPoll >= server.idlePollSeconds * 1000L) {
-                    step("pinned jobs / views", errors) { pollSlow(server, client, userId) }
+                    pollSlow(job, server, client, userId, errors)
                     lastSlowPoll = now
+                }
+                // The history looks at every job of the Jenkins: on its own, slower rhythm.
+                val settings = JenkSpotterSettings.getInstance().current
+                val wanted = if (settings.showAllRunning) settings.allBuildsHistory else 0
+                val pending = historyPending.remove(serverId)
+                if (pending || wanted != historyCount || now - lastHistoryPoll >= HISTORY_INTERVAL_MILLIS) {
+                    pollHistory(job, server, client, userId, wanted, errors)
+                    lastHistoryPoll = now
+                    historyCount = wanted
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -163,35 +197,56 @@ class BuildMonitorService(private val cs: CoroutineScope) {
                 if (e !is JenkinsException) thisLogger().warn("Polling ${server.url} failed", e)
                 if ((e as? JenkinsException)?.statusCode == 401) userId = null
                 unreachable = e.cause is java.io.IOException
+                pollFailed = true
                 errors += e.message ?: e.javaClass.simpleName
             }
-            val error = errors.firstOrNull()
-            failures = if (error == null) 0 else failures + 1
+            if (!job.isActive) return
+            // Refused steps may mean the session behind a proxy ended: whoAmI decides on the next poll.
+            if (errors.forbidden) userId = null
+            // A failed poll or server errors (5xx) may come from a session cookie that pins the requests
+            // to a Jenkins node that is gone; without it the next poll starts a fresh session.
+            if (pollFailed || errors.serverError) JenkinsConnections.getInstance().resetSessions(serverId)
+            failures = if (pollFailed) failures + 1 else 0
             logErrorChange(server, errors)
             val previous = statuses[serverId]
+            // Only a poll that failed as a whole means "not connected"; failed parts are warnings.
             statuses[serverId] = ServerStatus(
-                serverId, error == null, error, userId,
-                if (error == null) System.currentTimeMillis() else previous?.lastUpdate ?: 0,
+                serverId,
+                online = !pollFailed,
+                error = errors.firstOrNull()?.takeIf { pollFailed },
+                userId = userId,
+                lastUpdate = if (!pollFailed) System.currentTimeMillis() else previous?.lastUpdate ?: 0,
                 reachable = !unreachable,
+                warnings = if (pollFailed) emptyList() else errors.toList(),
             )
             publish()
 
+            val ended = System.currentTimeMillis()
             val delaySeconds = nextDelaySeconds(server, failures)
-            forceSlow = withTimeoutOrNull(delaySeconds * 1000) { wake.receive() } ?: false
+            var slow = withTimeoutOrNull(delaySeconds * 1000) { wake.receive() }
+            if (slow != null) {
+                // Several refresh requests in a row (start-up, a settings change) become one poll.
+                delay((MIN_POLL_GAP_MILLIS - (System.currentTimeMillis() - ended)).coerceAtLeast(0))
+                while (true) slow = (wake.tryReceive().getOrNull() ?: break) || slow == true
+            }
+            forceSlow = slow ?: false
         }
     }
 
-    private inline fun step(name: String, errors: MutableList<String>, block: () -> Unit) {
+    private inline fun step(job: Job, name: String, errors: PollErrors, block: () -> Unit) {
+        if (!job.isActive) throw CancellationException("polling stopped")
         try {
             block()
         } catch (e: JenkinsException) {
             // Unauthorized or unreachable: the whole poll failed, not just this step.
             if (e.statusCode == 401 || e.cause is java.io.IOException) throw e
+            if (e.statusCode == 403) errors.forbidden = true
+            if (e.statusCode >= 500) errors.serverError = true
             errors += "$name: ${e.message}"
         }
     }
 
-    private fun pollFast(server: ServerConfig, client: JenkinsClient, userId: String?, errors: MutableList<String>) {
+    private fun pollFast(job: Job, server: ServerConfig, client: JenkinsClient, userId: String?, errors: PollErrors) {
         val finished = mutableListOf<TrackedBuild>()
 
         fun interesting(users: Set<String>, upstream: List<de.pdenis.jenkspotter.api.UpstreamRef>) =
@@ -200,7 +255,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
 
         // 1. Own items (and follow-ups of tracked builds) waiting in the queue.
         if (server.trackOwnBuilds && userId != null) {
-            step("queue", errors) {
+            step(job, "queue", errors) {
                 for (entry in client.queueItems()) {
                     if (!interesting(entry.causeUserIds, entry.upstream)) continue
                     val key = TrackedBuild.keyOf(server.id, entry.url)
@@ -215,7 +270,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         // 2. Follow queue items until they become a build.
         for (trigger in queued.values.filter { it.serverId == server.id }) {
             val key = TrackedBuild.keyOf(server.id, trigger.queueUrl)
-            step("queue item", errors) {
+            step(job, "queue item", errors) {
                 try {
                     val state = client.queueItem(trigger.queueUrl)
                     when {
@@ -240,7 +295,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         val showAll = JenkSpotterSettings.getInstance().current.showAllRunning
         if (showAll) {
             // One listing with full build fields: no request per build, also for the uninteresting ones.
-            step("executors", errors) {
+            step(job, "executors", errors) {
                 var pending = client.runningBuilds()
                 val urls = pending.map { it.url }.toSet()
                 if (server.trackOwnBuilds && userId != null) {
@@ -254,19 +309,45 @@ class BuildMonitorService(private val cs: CoroutineScope) {
                         pending = next
                     }
                 }
-                synchronized(lock) {
+                val ended = synchronized(lock) {
                     for (build in pending.filter { it.url !in seen }) {
                         seen += build.url
                         store.upsert(server.id, build, BuildSource.RUNNING, userId)
                     }
-                    store.retainRunning(server.id, urls)
+                    store.endedRunning(server.id, urls)
+                }
+                // Finished builds stay listed with their result (hidden only by an explicit filter).
+                // They are someone else's, so finishing is not notified - unless their job is pinned,
+                // watched or a branch job: a short build may never be seen by the slow poll while running.
+                val settings = JenkSpotterSettings.getInstance().current
+                fun urls(jobs: List<de.pdenis.jenkspotter.settings.PinnedJob>) = jobs.filter { it.serverId == server.id }.map { it.url.trimEnd('/') }.toSet()
+                val watched = urls(settings.watchedJobs)
+                val pinned = urls(settings.pinnedJobs)
+                val branch = branchJobs.values.flatten().filter { it.first == server.id }.map { it.second.url.trimEnd('/') }.toSet()
+                for (tracked in ended) {
+                    val result = runCatching { client.build(tracked.build.url) }
+                    val build = result.getOrNull()
+                    if (build == null) {
+                        // Deleted: forget it. Anything else is tried again with the next poll.
+                        if ((result.exceptionOrNull() as? JenkinsException)?.statusCode == 404) synchronized(lock) { store.remove(tracked.key) }
+                        continue
+                    }
+                    val jobUrl = build.jobUrl.trimEnd('/')
+                    val source = when (jobUrl) {
+                        in watched -> BuildSource.WATCHED
+                        in pinned -> BuildSource.PINNED
+                        in branch -> BuildSource.BRANCH
+                        else -> BuildSource.RUNNING
+                    }
+                    val done = synchronized(lock) { store.upsert(server.id, build, source, userId) }
+                    if (source != BuildSource.RUNNING) done?.let(finished::add)
                 }
             }
         } else {
-            synchronized(lock) { store.retainRunning(server.id, emptySet()) }
+            synchronized(lock) { store.dropRunningOnly(server.id) }
         }
         if (!showAll && server.trackOwnBuilds && userId != null) {
-            step("executors", errors) {
+            step(job, "executors", errors) {
                 var pending = client.runningRefs()
                 // Repeat so grandchildren are picked up once their parent became tracked in this poll.
                 repeat(MAX_CHAIN_DEPTH) {
@@ -291,9 +372,9 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         //     and end between two polls, so check the downstream jobs of recently finished builds.
         val recent = synchronized(lock) { store.recentlyFinishedMine(server.id, DOWNSTREAM_WINDOW_MILLIS) }
         for (parent in recent) {
-            val job = JobIndexService.getInstance().jobByUrl(server.id, parent.build.jobUrl) ?: continue
-            for (downstream in job.downstream) {
-                step("downstream", errors) {
+            val parentJob = JobIndexService.getInstance().jobByUrl(server.id, parent.build.jobUrl) ?: continue
+            for (downstream in parentJob.downstream) {
+                step(job, "downstream", errors) {
                     try {
                         val url = de.pdenis.jenkspotter.api.JenkinsPaths.jobUrl(client.baseUrl, downstream)
                         for (build in client.recentBuilds(url, 3)) {
@@ -310,20 +391,22 @@ class BuildMonitorService(private val cs: CoroutineScope) {
 
         // 3c. Running pipelines that may wait for an input step (approval). Checked every few
         //     seconds per build only; the executor listing does not show the paused state.
-        step("input", errors) { checkInputs(server, client) }
+        step(job, "input", errors) { checkInputs(server, client) }
 
         // 4. Watched builds that left the executors or are not visible there: ask them directly.
         val stale = synchronized(lock) {
             store.running(server.id).filter { it.build.url !in seen && it.sources.any { s -> s != BuildSource.VIEW && s != BuildSource.RUNNING } }
         }
         for (tracked in stale) {
-            step("build", errors) {
+            step(job, "build", errors) {
                 try {
                     val build = client.build(tracked.build.url)
                     val source = tracked.sources.first { it != BuildSource.VIEW && it != BuildSource.RUNNING }
                     synchronized(lock) { store.upsert(server.id, build, source, userId) }?.let(finished::add)
                 } catch (e: JenkinsException) {
                     if (e.statusCode != 404) throw e
+                    // Deleted, renamed or moved while it ran: it would be shown (and polled) as running forever.
+                    synchronized(lock) { store.remove(tracked.key) }
                 }
             }
         }
@@ -336,6 +419,7 @@ class BuildMonitorService(private val cs: CoroutineScope) {
             .filter { it.build.isPipeline && (it.mine || it.sources.any { s -> s == BuildSource.PINNED || s == BuildSource.WATCHED || s == BuildSource.BRANCH }) }
         val runningKeys = running.map { it.key }.toSet()
         inputs.keys.removeIf { it.startsWith(server.id + " ") && it !in runningKeys }
+        lastInputCheck.keys.removeIf { it.startsWith(server.id + " ") && it !in runningKeys }
         for (tracked in running) {
             if (now - (lastInputCheck[tracked.key] ?: 0) < INPUT_CHECK_MILLIS) continue
             lastInputCheck[tracked.key] = now
@@ -374,11 +458,13 @@ class BuildMonitorService(private val cs: CoroutineScope) {
             queuedHere -> active
             running.isNotEmpty() -> {
                 val now = System.currentTimeMillis()
-                val remaining = running.minOf { r ->
+                // Close to the estimated end a build is asked often; long before it, and long after it
+                // (waiting for an approval, hanging), ever more rarely.
+                val distance = running.minOf { r ->
                     val estimate = r.build.estimatedDurationMillis
-                    if (estimate <= 0) 0L else (r.build.timestamp + estimate - now).coerceAtLeast(0)
+                    if (estimate <= 0) now - r.build.timestamp else kotlin.math.abs(r.build.timestamp + estimate - now)
                 }
-                (remaining / 1000 / 6).coerceIn(active, maxOf(active, MAX_RUNNING_INTERVAL_SECONDS))
+                (distance / 1000 / 6).coerceIn(active, maxOf(active, MAX_RUNNING_INTERVAL_SECONDS))
             }
             server.trackOwnBuilds -> {
                 val discovery = minOf(server.discoveryPollSeconds, server.idlePollSeconds).toLong()
@@ -389,37 +475,117 @@ class BuildMonitorService(private val cs: CoroutineScope) {
         return delay.coerceAtLeast(MIN_INTERVAL_SECONDS)
     }
 
-    private fun pollSlow(server: ServerConfig, client: JenkinsClient, userId: String?) {
+    /**
+     * Pinned, watched and branch jobs and the views. Each is asked on its own: one that fails (a
+     * deleted view, a job without permission) is reported and keeps the builds it had, the others
+     * are refreshed as usual.
+     */
+    private fun pollSlow(job: Job, server: ServerConfig, client: JenkinsClient, userId: String?, errors: PollErrors) {
         val settings = JenkSpotterSettings.getInstance().current
         val results = mutableListOf<Pair<BuildInfo, BuildSource>>()
-        for (pin in settings.pinnedJobs.filter { it.serverId == server.id }) {
+        val failedJobs = HashMap<BuildSource, MutableSet<String>>()
+        var viewsFailed = false
+        fun ask(source: BuildSource, name: String, jobUrl: String?, block: () -> Unit) {
+            if (!job.isActive) throw CancellationException("polling stopped")
             try {
-                client.recentBuilds(pin.url, settings.buildsPerPinnedJob).forEach { results += it to BuildSource.PINNED }
+                block()
             } catch (e: JenkinsException) {
-                if (e.statusCode != 404) throw e
+                if (e.statusCode == 401 || e.cause is java.io.IOException) throw e
+                // A job that no longer exists just has no builds; a missing view is a wrong setting.
+                if (e.statusCode == 404 && jobUrl != null) return
+                if (e.statusCode == 403) errors.forbidden = true
+                if (e.statusCode >= 500) errors.serverError = true
+                errors += "$name: ${e.message}"
+                when {
+                    jobUrl != null -> failedJobs.getOrPut(source) { HashSet() } += jobUrl.trimEnd('/')
+                    e.statusCode != 404 -> viewsFailed = true
+                }
+            }
+        }
+        for (pin in settings.pinnedJobs.filter { it.serverId == server.id }) {
+            ask(BuildSource.PINNED, pin.fullName, pin.url) {
+                client.recentBuilds(pin.url, settings.buildsPerPinnedJob).forEach { results += it to BuildSource.PINNED }
             }
         }
         for (watched in settings.watchedJobs.filter { it.serverId == server.id }) {
-            try {
+            ask(BuildSource.WATCHED, watched.fullName, watched.url) {
                 client.recentBuilds(watched.url, settings.buildsPerPinnedJob).forEach { results += it to BuildSource.WATCHED }
-            } catch (e: JenkinsException) {
-                if (e.statusCode != 404) throw e
             }
         }
-        for ((_, job) in branchJobs.values.flatten().filter { it.first == server.id }.distinctBy { it.second.url }) {
-            try {
-                client.recentBuilds(job.url, 3).forEach { results += it to BuildSource.BRANCH }
-            } catch (e: JenkinsException) {
-                if (e.statusCode != 404) throw e
+        for ((_, branch) in branchJobs.values.flatten().filter { it.first == server.id }.distinctBy { it.second.url }) {
+            ask(BuildSource.BRANCH, branch.fullName, branch.url) {
+                client.recentBuilds(branch.url, 3).forEach { results += it to BuildSource.BRANCH }
             }
         }
         for (view in server.views.filter { it.isNotBlank() }) {
-            client.viewLastBuilds(view).forEach { results += it to BuildSource.VIEW }
+            ask(BuildSource.VIEW, "view $view", null) {
+                client.viewLastBuilds(view).forEach { results += it to BuildSource.VIEW }
+            }
         }
         val finished = synchronized(lock) {
-            store.applySlowPoll(server.id, results, userId).also { store.prune(settings.ownHistoryHours) }
+            store.applySlowPoll(server.id, results, userId) { tracked, source ->
+                if (source == BuildSource.VIEW) viewsFailed else tracked.build.jobUrl.trimEnd('/') in failedJobs[source].orEmpty()
+            }.also { store.prune(settings.ownHistoryHours) }
         }
         dispatchFinished(finished)
+    }
+
+    /**
+     * "All builds": the last [count] finished builds of all jobs. One listing finds them; details
+     * are fetched only for builds not known yet (finished builds do not change), at most
+     * [MAX_HISTORY_FETCHES] per poll so a first load does not flood Jenkins. It is an extra: a
+     * failure is reported but never makes the Jenkins count as unreachable.
+     */
+    private fun pollHistory(job: Job, server: ServerConfig, client: JenkinsClient, userId: String?, count: Int, errors: PollErrors) {
+        if (count <= 0) {
+            synchronized(lock) { store.retainHistory(server.id, emptySet()) }
+            return
+        }
+        val refs = try {
+            client.recentBuildRefs(HISTORY_PER_JOB)
+        } catch (e: JenkinsException) {
+            if (e.statusCode == 401) throw e
+            if (e.statusCode >= 500) errors.serverError = true
+            errors += "recent builds of all jobs: ${e.message}"
+            return
+        }
+        val now = System.currentTimeMillis()
+        historyFailed.values.removeIf { now - it > HISTORY_RETRY_MILLIS }
+        val latest = refs.filter { !it.building }.sortedByDescending { it.timestamp }.take(count)
+        var attempts = 0
+        var more = false
+        val listed = HashSet<String>()
+        for (ref in latest) {
+            if (!job.isActive) throw CancellationException("polling stopped")
+            val known = synchronized(lock) { store.get(server.id, ref.url) }
+            val failedKey = TrackedBuild.keyOf(server.id, ref.url)
+            val build = when {
+                known != null && !known.build.building -> known.build
+                historyFailed.containsKey(failedKey) -> continue
+                attempts >= MAX_HISTORY_FETCHES -> {
+                    more = true
+                    continue
+                }
+                else -> {
+                    attempts++
+                    val fetched = runCatching { client.build(ref.url) }.getOrNull()
+                    if (fetched == null) {
+                        historyFailed[failedKey] = now
+                        continue
+                    }
+                    fetched
+                }
+            }
+            listed += ref.url
+            synchronized(lock) { store.upsert(server.id, build, BuildSource.HISTORY, userId) }
+        }
+        synchronized(lock) { store.retainHistory(server.id, listed) }
+        thisLogger().debug("JenkSpotter: ${server.displayName} history: ${refs.size} builds seen, ${listed.size} listed, $attempts fetched")
+        // The rest follows right away, without asking pins and views again.
+        if (more) {
+            historyPending += server.id
+            refresh(server.id, includeSlow = false)
+        }
     }
 
     private fun logErrorChange(server: ServerConfig, errors: List<String>) {
@@ -481,7 +647,15 @@ class BuildMonitorService(private val cs: CoroutineScope) {
     }
 
     companion object {
-        private const val MAX_BACKOFF_SECONDS = 300L
+        /** Newest builds asked for per job; a job building more often than that fills fewer places. */
+        private const val HISTORY_PER_JOB = 2
+        private const val MAX_HISTORY_FETCHES = 40
+        private const val HISTORY_INTERVAL_MILLIS = 2L * 60 * 1000
+        private const val HISTORY_RETRY_MILLIS = 10L * 60 * 1000
+        /** Refresh requests arriving within this time after a poll wait and are merged into one. */
+        private const val MIN_POLL_GAP_MILLIS = 2_000L
+        /** A Jenkins that is back is noticed within a minute at the latest. */
+        private const val MAX_BACKOFF_SECONDS = 60L
         private const val MIN_INTERVAL_SECONDS = 2L
         private const val MAX_RUNNING_INTERVAL_SECONDS = 30L
         private const val INPUT_CHECK_MILLIS = 8_000L

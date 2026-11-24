@@ -24,7 +24,6 @@ import de.pdenis.jenkspotter.core.MonitorSnapshot
 import de.pdenis.jenkspotter.settings.JenkSpotterConfigurable
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
 import de.pdenis.jenkspotter.settings.ServerConfig
-import de.pdenis.jenkspotter.settings.VisibilityToggle
 import java.awt.BasicStroke
 import java.awt.Component
 import java.awt.FlowLayout
@@ -42,10 +41,11 @@ object ServerStatusUi {
 
     fun icon(state: ConnectionState): Icon = when (state) {
         ConnectionState.CONNECTED -> StatusDot(GREEN, filled = true)
-        ConnectionState.ERROR -> StatusDot(JBColor.ORANGE, filled = true)
-        ConnectionState.OFFLINE -> StatusDot(JBColor.RED, filled = true)
+        ConnectionState.ERROR -> StatusDot(JBColor.RED, filled = true)
+        ConnectionState.OFFLINE -> StatusDot(JBColor.GRAY, filled = true)
         ConnectionState.DISABLED -> StatusDot(JBColor.GRAY, filled = false)
-        ConnectionState.CONNECTING -> StatusDot(JBColor.GRAY, filled = true)
+        // Lighter than offline: the first answer is still pending.
+        ConnectionState.CONNECTING -> StatusDot(JBColor(0xC9CBCF, 0x5E6064), filled = true)
     }
 
     fun label(state: ConnectionState): String = JenkSpotterBundle.message("connection.${state.name}")
@@ -73,6 +73,13 @@ object ServerStatusUi {
         }
         if (state == ConnectionState.ERROR || state == ConnectionState.OFFLINE) status?.error?.let {
             out.append("<br><font color='#").append(com.intellij.ui.ColorUtil.toHex(JBColor.RED)).append("'>").append(e(it)).append("</font>")
+        }
+        // Connected, but Jenkins could not answer everything: said here, the light stays green.
+        if (state == ConnectionState.CONNECTED && !status?.warnings.isNullOrEmpty()) {
+            out.append("<br>").append(e(JenkSpotterBundle.message("connection.warnings")))
+            status!!.warnings.forEach {
+                out.append("<br><font color='#").append(com.intellij.ui.ColorUtil.toHex(JBColor.ORANGE)).append("'>").append(e(it)).append("</font>")
+            }
         }
         status?.lastUpdate?.takeIf { it > 0 }?.let {
             out.append("<br>").append(e(JenkSpotterBundle.message("connection.lastUpdate", DateFormatUtil.formatPrettyDateTime(it))))
@@ -114,25 +121,6 @@ object ServerStatusUi {
         }
 
     private val GREEN = JBColor(0x3E9B4F, 0x5AA469)
-
-    /** Icon of the show/hide toggle; styles without a "hidden" variant are greyed out instead. Null for no icon. */
-    fun toggleIcon(style: VisibilityToggle, hidden: Boolean): Icon? {
-        val (shown, off) = when (style) {
-            VisibilityToggle.EYE -> AllIcons.Actions.ToggleVisibility to null
-            VisibilityToggle.EYE_CROSSED -> AllIcons.General.TbShown to AllIcons.General.TbHidden
-            VisibilityToggle.SMALL_EYE -> com.intellij.util.IconUtil.scale(AllIcons.Actions.ToggleVisibility, null, 0.7f) to null
-            VisibilityToggle.SHOW -> AllIcons.Actions.Show to null
-            VisibilityToggle.CHECKMARK -> AllIcons.Actions.Checked to null
-            VisibilityToggle.BULB -> AllIcons.Actions.IntentionBulb to AllIcons.Actions.QuickfixOffBulb
-            VisibilityToggle.TRAFFIC -> AllIcons.General.InspectionsOK to AllIcons.General.InspectionsTrafficOff
-            VisibilityToggle.VISIBILITY -> AllIcons.Nodes.Public to AllIcons.Nodes.Private
-            VisibilityToggle.LOCK -> AllIcons.Ide.Readwrite to AllIcons.Ide.Readonly
-            VisibilityToggle.LIKE -> AllIcons.Ide.Like to AllIcons.Ide.LikeDimmed
-            VisibilityToggle.STAR -> AllIcons.Nodes.Favorite to null
-            VisibilityToggle.CHECKBOX, VisibilityToggle.NONE -> return null
-        }
-        return if (!hidden) shown else off ?: com.intellij.openapi.util.IconLoader.getDisabledIcon(shown)
-    }
 }
 
 /** Small round status light; hollow for disabled servers. */
@@ -195,36 +183,21 @@ class ServerStatusBar(private val project: Project) : JPanel(com.intellij.util.u
                     }
                 }.installOn(this)
             })
-            if (state != ConnectionState.DISABLED) visibilityToggle(server.id, hidden)?.let(entry::add)
+            if (state != ConnectionState.DISABLED) entry.add(visibilityToggle(server.id, hidden))
             add(entry)
         }
         revalidate()
         repaint()
     }
 
-    private fun visibilityToggle(serverId: String, hidden: Boolean): javax.swing.JComponent? {
-        val style = JenkSpotterSettings.getInstance().current.visibilityToggle
-        if (style == VisibilityToggle.CHECKBOX) {
-            return com.intellij.ui.components.JBCheckBox(null, !hidden).apply {
-                isOpaque = false
-                border = JBUI.Borders.emptyLeft(2)
-                toolTipText = JenkSpotterBundle.message(if (hidden) "connection.show" else "connection.hide")
-                addActionListener { JenkSpotterSettings.getInstance().setServerHidden(serverId, !isSelected) }
-            }
-        }
-        val icon = ServerStatusUi.toggleIcon(style, hidden) ?: return null
-        return JBLabel(icon).apply {
+    /** Check box next to the light: unchecked hides the Jenkins' jobs and builds (it is still polled). */
+    private fun visibilityToggle(serverId: String, hidden: Boolean): javax.swing.JComponent =
+        com.intellij.ui.components.JBCheckBox(null, !hidden).apply {
+            isOpaque = false
             border = JBUI.Borders.emptyLeft(2)
-            cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
             toolTipText = JenkSpotterBundle.message(if (hidden) "connection.show" else "connection.hide")
-            object : ClickListener() {
-                override fun onClick(event: MouseEvent, clickCount: Int): Boolean {
-                    JenkSpotterSettings.getInstance().setServerHidden(serverId, !hidden)
-                    return true
-                }
-            }.installOn(this)
+            accessibleContext.accessibleName = toolTipText
+            addActionListener { JenkSpotterSettings.getInstance().setServerHidden(serverId, !isSelected) }
         }
-    }
-
 
 }

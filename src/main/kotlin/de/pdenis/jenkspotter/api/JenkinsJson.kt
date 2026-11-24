@@ -151,6 +151,53 @@ internal object JenkinsJson {
         )
     } ?: emptyList()
 
+    /** Nested stages from `stages/tree` (Pipeline Graph View plugin). */
+    fun parseStageTree(json: JsonObject): List<Stage> {
+        fun parse(node: JsonElement): Stage? {
+            val o = node.obj() ?: return null
+            return Stage(
+                o.str("id") ?: return null, o.str("name").orEmpty(), graphState(o.str("state")),
+                o.long("startTimeMillis"), o.long("totalDurationMillis"), o.long("pauseDurationMillis"),
+                o["children"].arr()?.mapNotNull(::parse).orEmpty(), o.str("type") == "PARALLEL",
+            )
+        }
+        return json["data"].obj()?.get("stages").arr()?.mapNotNull(::parse) ?: throw IllegalArgumentException("no stages")
+    }
+
+    /** Every step of a build from `stages/allSteps` (Pipeline Graph View plugin), without logs. */
+    fun parseAllSteps(json: JsonObject): List<StageStep> = json["data"].obj()?.get("steps").arr()?.mapNotNull { s ->
+        val o = s.obj() ?: return@mapNotNull null
+        StageStep(o.str("id") ?: return@mapNotNull null, o.str("title").orEmpty(), o.str("name").orEmpty(), graphState(o.str("state")), "", false, o.str("stageId").orEmpty())
+    } ?: emptyList()
+
+    /** Pipeline Graph View states mapped to the Stage View names [Stage.status] uses. */
+    private fun graphState(state: String?): String = when (state?.lowercase()) {
+        "success" -> "SUCCESS"
+        "failure" -> "FAILED"
+        "unstable" -> "UNSTABLE"
+        "aborted" -> "ABORTED"
+        "not_built", "skipped" -> "NOT_EXECUTED"
+        "running" -> "IN_PROGRESS"
+        "paused" -> "PAUSED_PENDING_INPUT"
+        else -> state.orEmpty().uppercase()
+    }
+
+    /** Steps of a stage from `execution/node/<id>/wfapi/describe`, without their logs: id, name, description, status. */
+    fun parseStageSteps(json: JsonObject): List<StageStep> = json["stageFlowNodes"].arr()?.mapNotNull { n ->
+        val o = n.obj() ?: return@mapNotNull null
+        StageStep(o.str("id") ?: return@mapNotNull null, o.str("name").orEmpty(), o.str("parameterDescription").orEmpty(), o.str("status").orEmpty(), "", false)
+    } ?: emptyList()
+
+    /** Log text of one step from `execution/node/<id>/wfapi/log`, console notes stripped; and whether it was cut. */
+    fun parseStepLog(json: JsonObject): Pair<String, Boolean> = plainLog(json.str("text").orEmpty()) to json.bool("hasMore")
+
+    /** The log text may carry console annotations as HTML; plain text is wanted. */
+    fun plainLog(text: String): String {
+        if ('<' !in text && '&' !in text) return text
+        return text.replace(Regex("<[^>]*>"), "")
+            .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&amp;", "&")
+    }
+
     fun parsePendingInputs(array: JsonArray): List<PendingInput> = array.mapNotNull { i ->
         val o = i.obj() ?: return@mapNotNull null
         PendingInput(

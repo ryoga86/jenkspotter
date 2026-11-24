@@ -137,6 +137,39 @@ jobs:
         }
       }
 
+      // Stages nested in stages and parallel branches, several levels deep, with ANSI output.
+      pipelineJob('team/nested') {
+        definition {
+          cps {
+            sandbox(true)
+            script('''
+              pipeline {
+                agent any
+                stages {
+                  stage('Build') { steps { echo 'compiling' } }
+                  stage('Verify') {
+                    parallel {
+                      stage('Unit') { steps { echo 'unit tests'; sh 'printf "\\033[31mred error\\033[0m\\n"' } }
+                      stage('Integration') {
+                        stages {
+                          stage('Setup') { steps { echo 'setup db' } }
+                          stage('Run') {
+                            stages {
+                              stage('Deep') { steps { echo 'deep inside'; sleep 1 } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                  stage('Deploy') { steps { echo 'deploying' } }
+                }
+              }
+            '''.stripIndent())
+          }
+        }
+      }
+
       // All parameter types we support, including Active Choices, credentials and run parameters.
       pipelineJob('team/all-params') {
         parameters {

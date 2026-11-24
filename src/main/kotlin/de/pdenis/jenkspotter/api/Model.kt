@@ -3,8 +3,6 @@ package de.pdenis.jenkspotter.api
 enum class BuildResult {
     SUCCESS, UNSTABLE, FAILURE, ABORTED, NOT_BUILT, RUNNING, UNKNOWN;
 
-    val isFinished: Boolean get() = this != RUNNING
-
     companion object {
         fun of(result: String?, building: Boolean): BuildResult = when {
             building -> RUNNING
@@ -37,6 +35,9 @@ data class JobRef(
     val canBuild: Boolean get() = isBuildable && !disabled
 
     val isFolder: Boolean get() = FOLDER_CLASS_HINTS.any { jobClass.contains(it) }
+
+    /** Multibranch pipeline or organization folder: a folder with one job per branch. */
+    val isMultiBranch: Boolean get() = jobClass.contains("MultiBranchProject") || jobClass.contains("OrganizationFolder")
     val isBuildable: Boolean get() = !isFolder
 
     companion object {
@@ -48,9 +49,7 @@ data class JobRef(
 
 data class BuildParameter(val name: String, val value: String?)
 
-data class TestCounts(val total: Int, val failed: Int, val skipped: Int) {
-    val passed: Int get() = total - failed - skipped
-}
+data class TestCounts(val total: Int, val failed: Int, val skipped: Int)
 
 /** The build that started another build (UpstreamCause). */
 data class UpstreamRef(val jobUrl: String, val number: Int) {
@@ -123,7 +122,39 @@ data class BuildForm(val crumb: String?, val parameters: Map<String, FormChoices
     }
 }
 
-data class Stage(val id: String, val name: String, val status: String, val startMillis: Long, val durationMillis: Long, val pauseMillis: Long) {
+/** One step of a pipeline stage with its own log, see [JenkinsClient.stageLog]. */
+data class StageStep(
+    val id: String,
+    /** Step type, e.g. "Shell Script"; may be empty (echo). */
+    val name: String,
+    /** What the step was given, e.g. the shell command; may be empty. */
+    val description: String,
+    val status: String,
+    /** Log text; may contain ANSI colour codes. */
+    val log: String,
+    /** Jenkins cut the log; the full one is in the build's console. */
+    val truncated: Boolean,
+    /** Stage the step belongs to: the selected one or one nested in it. */
+    val stageId: String = "",
+)
+
+/**
+ * A pipeline stage. [status] uses the Stage View names (SUCCESS, FAILED, IN_PROGRESS, ...).
+ * [children]: nested stages and parallel branches ([parallel]), any depth.
+ */
+data class Stage(
+    val id: String,
+    val name: String,
+    val status: String,
+    val startMillis: Long,
+    val durationMillis: Long,
+    val pauseMillis: Long,
+    val children: List<Stage> = emptyList(),
+    val parallel: Boolean = false,
+) {
+    /** This stage and every stage nested in it, depth first. */
+    fun flatten(): List<Stage> = listOf(this) + children.flatMap { it.flatten() }
+
     val result: BuildResult get() = when (status) {
         "SUCCESS" -> BuildResult.SUCCESS
         "FAILED" -> BuildResult.FAILURE
@@ -175,6 +206,9 @@ data class QueueEntry(
 
 /** Minimal executor entry: just enough to decide whether a running build is of interest. */
 data class RunningRef(val url: String, val causeUserIds: Set<String>, val upstream: List<UpstreamRef>)
+
+/** A build known only by URL, start time and whether it still runs, see [JenkinsClient.recentBuildRefs]. */
+data class BuildRef(val url: String, val timestamp: Long, val building: Boolean)
 
 data class LogChunk(val text: String, val nextOffset: Long, val hasMore: Boolean)
 

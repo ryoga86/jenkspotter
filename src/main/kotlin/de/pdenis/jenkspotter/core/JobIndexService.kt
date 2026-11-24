@@ -55,16 +55,58 @@ class JobIndexService(private val cs: CoroutineScope) {
         val upstream: Map<String, List<JobRef>> by lazy {
             jobs.flatMap { job -> job.downstream.map { it to job } }.groupBy({ it.first }, { it.second })
         }
+
+        /** Rendering asks for these per row and repaint; a new index state starts empty. */
+        internal val chains = ConcurrentHashMap<String, List<ChainNode>>()
+        internal val positions = ConcurrentHashMap<String, java.util.Optional<ChainPosition>>()
+        internal val longestUp = ConcurrentHashMap<String, List<JobRef>>()
+        internal val badges = ConcurrentHashMap<String, JobBadges>()
     }
 
     private val states = ConcurrentHashMap<String, IndexState>()
     private val running = ConcurrentHashMap<String, Job>()
 
-    fun state(serverId: String): IndexState = states.computeIfAbsent(serverId) { loadFromDisk(it) }
+    /** Servers whose index file is being read for the UI thread; completed with what was read. */
+    private val reading = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<IndexState>>()
+
+    /**
+     * The index of a server. The first call reads its file. The UI thread never waits for that: it
+     * gets an empty, loading state and [JobIndexListener] fires once the file is read. Background
+     * threads get the read index.
+     */
+    fun state(serverId: String): IndexState {
+        val onUiThread = ApplicationManager.getApplication().isDispatchThread
+        if (!onUiThread) reading[serverId]?.let { return it.join() }
+        states[serverId]?.let { return it }
+        if (!onUiThread) return states.computeIfAbsent(serverId) { loadFromDisk(it) }
+        val future = java.util.concurrent.CompletableFuture<IndexState>()
+        val placeholder = IndexState(loading = true)
+        reading.putIfAbsent(serverId, future)?.let { return states[serverId] ?: placeholder }
+        states.putIfAbsent(serverId, placeholder)?.let { existing ->
+            // A background thread read it in the meantime.
+            reading.remove(serverId, future)
+            future.complete(existing)
+            return existing
+        }
+        cs.launch(Dispatchers.IO) {
+            val loaded = loadFromDisk(serverId)
+            states[serverId] = loaded
+            reading.remove(serverId, future)
+            ApplicationManager.getApplication().messageBus.syncPublisher(JobIndexListener.TOPIC).indexChanged(serverId)
+            future.complete(loaded)
+        }
+        return placeholder
+    }
 
     /** Refreshes in the background if forced, empty, or older than [MAX_AGE_MILLIS]. */
     fun refreshIfNeeded(server: ServerConfig, force: Boolean = false) {
-        val current = state(server.id)
+        // Starts reading the file if this is the first use; whether a refresh is due is only known afterwards.
+        state(server.id)
+        reading[server.id]?.let { pending ->
+            pending.thenRun { refreshIfNeeded(server, force) }
+            return
+        }
+        val current = states[server.id] ?: return
         val stale = System.currentTimeMillis() - current.updatedAt > MAX_AGE_MILLIS
         if (!force && !stale && current.jobs.isNotEmpty()) return
         if (running[server.id]?.isActive == true) return
@@ -114,7 +156,10 @@ class JobIndexService(private val cs: CoroutineScope) {
      * Follow-up jobs known in advance (freestyle "Build other projects"), transitively, as a tree.
      * Pipeline `build job:` steps are not visible before they run.
      */
-    fun chain(serverId: String, job: JobRef, depth: Int = 0, seen: MutableSet<String> = HashSet()): List<ChainNode> {
+    fun chain(serverId: String, job: JobRef): List<ChainNode> =
+        state(serverId).chains.getOrPut(job.fullName) { chain(serverId, job, 0, HashSet()) }
+
+    private fun chain(serverId: String, job: JobRef, depth: Int, seen: MutableSet<String>): List<ChainNode> {
         if (depth >= MAX_CHAIN_DEPTH || !seen.add(job.fullName)) return emptyList()
         return job.downstream.map { name ->
             val next = jobByFullName(serverId, name)
@@ -123,15 +168,38 @@ class JobIndexService(private val cs: CoroutineScope) {
     }
 
     /**
-     * Where [job] sits in a chain of follow-up jobs: the longest path of upstream jobs leading to it
-     * (first entry = the job starting the chain) and how many steps the chain has below it. Null if
-     * no job triggers [job].
+     * Where [job] sits in chains of follow-up jobs: every path of upstream jobs leading to it, the
+     * longest first (first entry of a path = the job starting that chain), and how many steps follow
+     * below it. A job triggered by several jobs is in several chains. Null if no job triggers [job].
      */
-    fun position(serverId: String, job: JobRef): ChainPosition? {
-        val path = upstreamPath(state(serverId), job)
-        if (path.isEmpty()) return null
-        fun depth(nodes: List<ChainNode>): Int = nodes.maxOfOrNull { 1 + depth(it.children) } ?: 0
-        return ChainPosition(path, job, depth(chain(serverId, job)))
+    fun position(serverId: String, job: JobRef): ChainPosition? =
+        state(serverId).positions.getOrPut(job.fullName) { java.util.Optional.ofNullable(computePosition(serverId, job)) }.orElse(null)
+
+    private fun computePosition(serverId: String, job: JobRef): ChainPosition? {
+        val paths = upstreamPaths(state(serverId), job)
+        return if (paths.isEmpty()) null else ChainPosition(paths, job)
+    }
+
+    /**
+     * What the jobs list shows next to [job]. Kept per index state, so painting a row is a lookup;
+     * the list asks for all its rows in the background before it shows them.
+     */
+    fun badges(serverId: String, job: JobRef): JobBadges {
+        val state = state(serverId)
+        return state.badges.getOrPut(job.fullName) {
+            val triggeredBy = if (job.isFolder) 0 else state.upstream[job.fullName]?.size ?: 0
+            val position = if (triggeredBy > 0) position(serverId, job) else null
+            val chain = if (job.downstream.isEmpty()) emptyList() else chain(serverId, job)
+            val parent = job.fullName.substringBeforeLast('/', "")
+            JobBadges(
+                triggeredBy = triggeredBy,
+                blocked = position?.blockedBy != null,
+                followUps = chain.sumOf { it.size },
+                activeFollowUps = chain.sumOf { it.activeSize },
+                workflow = if (job.isFolder) null else position?.path?.firstOrNull()?.fullName ?: job.fullName.takeIf { chain.isNotEmpty() },
+                inMultiBranch = parent.isNotEmpty() && state.byFullName[parent]?.isMultiBranch == true,
+            )
+        }
     }
 
     fun forget(serverId: String) {
@@ -174,7 +242,10 @@ class JobIndexService(private val cs: CoroutineScope) {
     private fun save(serverId: String, jobs: List<JobRef>) {
         val f = file(serverId)
         Files.createDirectories(f.parent)
-        f.writeLines(listOf(System.currentTimeMillis().toString()) + jobs.map { "${it.name}\t${it.fullName}\t${it.url}\t${it.jobClass}\t${it.downstream.joinToString(",")}\t${it.parameterCount}\t${if (it.disabled) "disabled" else ""}\t${it.repos.joinToString(" ")}" })
+        // Written next to it and moved into place: a crash half-way must not leave a cut-off index that looks fresh.
+        val temp = f.resolveSibling(f.fileName.toString() + ".tmp")
+        temp.writeLines(listOf(System.currentTimeMillis().toString()) + jobs.map { "${it.name}\t${it.fullName}\t${it.url}\t${it.jobClass}\t${it.downstream.joinToString(",")}\t${it.parameterCount}\t${if (it.disabled) "disabled" else ""}\t${it.repos.joinToString(" ")}" })
+        Files.move(temp, f, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
     }
 
     companion object {
@@ -184,15 +255,51 @@ class JobIndexService(private val cs: CoroutineScope) {
 
         fun getInstance(): JobIndexService = service()
 
-        /** Longest chain of jobs triggering [job], starting with the first one; empty if none does. */
+        /**
+         * Longest chain of jobs triggering [job], starting with the first one; empty if none does.
+         * The longest way up is kept per job ([IndexState.longestUp]): without that, every job
+         * reached over several paths would be walked once per path.
+         */
         fun upstreamPath(state: IndexState, job: JobRef): List<JobRef> {
-            fun longestUp(name: String, seen: Set<String>): List<JobRef> {
-                if (seen.size >= MAX_CHAIN_DEPTH) return emptyList()
-                return state.upstream[name].orEmpty().filter { it.fullName !in seen }
-                    .map { longestUp(it.fullName, seen + it.fullName) + it }
-                    .maxByOrNull { it.size }.orEmpty()
+            val inProgress = HashSet<String>()
+            // Jobs skipped because they are on the way down already (A triggers B triggers A).
+            var cuts = 0
+            fun longestUp(name: String): List<JobRef> {
+                state.longestUp[name]?.let { return it }
+                inProgress += name
+                val before = cuts
+                val ups = state.upstream[name].orEmpty().filter { up -> (up.fullName !in inProgress).also { if (!it) cuts++ } }
+                val best = ups.map { longestUp(it.fullName) + it }.maxByOrNull { it.size }.orEmpty().takeLast(MAX_CHAIN_DEPTH - 1)
+                inProgress -= name
+                // A result shortened by a cycle depends on where the walk started: not kept.
+                if (cuts == before) state.longestUp[name] = best
+                return best
             }
-            return longestUp(job.fullName, setOf(job.fullName))
+            return longestUp(job.fullName)
+        }
+
+        /**
+         * All paths of jobs triggering [job], each starting with the job that starts it; the longest
+         * ([upstreamPath]) first, then by length. At most [MAX_PATHS], since fan-in multiplies them.
+         */
+        fun upstreamPaths(state: IndexState, job: JobRef): List<List<JobRef>> {
+            val longest = upstreamPath(state, job)
+            if (longest.isEmpty()) return emptyList()
+            val found = LinkedHashSet<List<String>>()
+            val result = mutableListOf<List<JobRef>>()
+            // Walks upwards; [below] is the path from the current job down to [job] (excluded).
+            fun walk(name: String, below: List<JobRef>, seen: Set<String>) {
+                if (result.size >= MAX_PATHS) return
+                val ups = if (seen.size >= MAX_CHAIN_DEPTH) emptyList() else state.upstream[name].orEmpty().filter { it.fullName !in seen }
+                if (ups.isEmpty()) {
+                    if (below.isNotEmpty() && found.add(below.map { it.fullName })) result += below
+                    return
+                }
+                for (up in ups) walk(up.fullName, listOf(up) + below, seen + up.fullName)
+            }
+            walk(job.fullName, emptyList(), setOf(job.fullName))
+            val others = result.filter { it.map(JobRef::fullName) != longest.map(JobRef::fullName) }
+            return listOf(longest) + others.sortedByDescending { it.size }.take(MAX_PATHS - 1)
         }
 
         /** Breadth-first crawl; [fetch] returns jobs below a folder (null = root) plus unexplored folders. */
@@ -260,6 +367,7 @@ class JobIndexService(private val cs: CoroutineScope) {
         }
 
         private const val MAX_CHAIN_DEPTH = 8
+        private const val MAX_PATHS = 50
         private const val MAX_RECENT_RANK = 30
         private const val RECENT_BONUS = 5
         private const val FOLDER_PENALTY = 500
@@ -278,23 +386,27 @@ data class JobHit(
     val watched: Boolean = false,
 )
 
-/** One follow-up job in a chain; [url] is null if the job is not in the index. */
-/** A job inside a follow-up chain, see [JobIndexService.position]. */
+/** A job inside one or more follow-up chains, see [JobIndexService.position]. */
 data class ChainPosition(
-    /** Jobs before it, starting with the one that starts the chain. */
-    val path: List<JobRef>,
+    /** Every path of jobs before it, each starting with the job that starts it; the longest first. */
+    val paths: List<List<JobRef>>,
     val job: JobRef,
-    /** Longest number of follow-up steps after it. */
-    val below: Int,
 ) {
-    /** 1-based step of [job]; the starting job is step 1. */
-    val step: Int get() = path.size + 1
-    val length: Int get() = step + below
+    /** The longest path. */
+    val path: List<JobRef> get() = paths.first()
 
-    /** First disabled job before it: the chain stops there, so [job] is not triggered by it. */
-    val blockedBy: JobRef? get() = path.firstOrNull { it.disabled }
+    /** The longest path per starting job, longest first: one entry per chain [job] is in. */
+    val chains: List<List<JobRef>> get() = paths.groupBy { it.first().fullName }.values.map { it.first() }
+
+    /**
+     * First disabled job before it when every path has one: then nothing triggers [job]. If one
+     * path is free, another job still triggers it, so it is null.
+     */
+    val blockedBy: JobRef?
+        get() = if (paths.isNotEmpty() && paths.all { p -> p.any { it.disabled } }) paths.first().first { it.disabled } else null
 }
 
+/** One follow-up job in a chain; [url] is null if the job is not in the index. */
 data class ChainNode(
     val fullName: String,
     val url: String?,
@@ -306,14 +418,19 @@ data class ChainNode(
 
     /** Jobs of this subtree that will actually run (a disabled job cuts off everything below it). */
     val activeSize: Int get() = if (disabled) 0 else 1 + children.sumOf { it.activeSize }
-
-    /** "middle -> last" for a straight chain, "a (-> b), c" when it branches. */
-    fun describe(): String {
-        val name = de.pdenis.jenkspotter.api.JenkinsPaths.displayName(fullName.substringAfterLast('/'))
-        return when (children.size) {
-            0 -> name
-            1 -> "$name \u2192 ${children.single().describe()}"
-            else -> "$name \u2192 (${children.joinToString(", ") { it.describe() }})"
-        }
-    }
 }
+
+/** Trigger information of a job as the jobs list shows it, see [JobIndexService.badges]. */
+data class JobBadges(
+    /** Number of jobs triggering it directly. */
+    val triggeredBy: Int,
+    /** A disabled job on every way to it: nothing triggers it at the moment. */
+    val blocked: Boolean,
+    /** Follow-up jobs, direct and indirect; [activeFollowUps] of them will actually run. */
+    val followUps: Int,
+    val activeFollowUps: Int,
+    /** Full name of the job starting the workflow it belongs to; null if it is in none. */
+    val workflow: String?,
+    /** A branch of a multibranch pipeline. */
+    val inMultiBranch: Boolean,
+)
