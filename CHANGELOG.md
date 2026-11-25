@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-11-24
+## [1.0.0] - 2026-11-25
 
 First public release.
 
