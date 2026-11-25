@@ -71,7 +71,7 @@ class SharedFilter {
 
 /**
  * Tool window content: the Jenkins view (left: jobs per Jenkins, with the Jenkins selection on top
- * and connection lights plus filter chips at the bottom) and the builds view (right: builds table,
+ * and filter chips plus connection lights at the bottom) and the builds view (right: builds table,
  * build info below).
  */
 class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
@@ -87,6 +87,8 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
 
     init {
         serverCombo.addActionListener {
+            // Refilling the combo passes through "nothing selected"; that is not a choice of the user.
+            if (rebuildingBar) return@addActionListener
             val id = (serverCombo.selectedItem as? ServerItem)?.id
             if (id != filter.serverId) filter.serverId = id
         }
@@ -100,8 +102,8 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
         jobs.setBottomBar(JPanel(com.intellij.ui.components.panels.VerticalLayout(0)).apply {
             isOpaque = false
             border = JBUI.Borders.empty(2, 4, 0, 4)
-            add(serverStatus)
             add(filterBar)
+            add(serverStatus)
         })
 
         val connection = ApplicationManager.getApplication().messageBus.connect(this)
@@ -122,6 +124,9 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
 
     private var shownStatus: Any? = null
 
+    /** True while [rebuildBar] refills the Jenkins combo. */
+    private var rebuildingBar = false
+
     private fun updateServerStatus(snapshot: MonitorSnapshot, force: Boolean = false) {
         val settings = JenkSpotterSettings.getInstance().current
         val key = settings.servers.map { Triple(it.id, it.displayName, snapshot.servers[it.id]?.let { s -> s.copy(lastUpdate = 0) } to it.enabled) }
@@ -133,13 +138,18 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
     private fun rebuildBar() {
         val selected = filter.serverId
         val items = ServerItem.all(includeAll = true)
-        serverCombo.removeAllItems()
-        items.forEach(serverCombo::addItem)
         val target = items.firstOrNull { it.id == selected } ?: items.firstOrNull()
-        serverCombo.selectedItem = target
+        rebuildingBar = true
+        try {
+            serverCombo.removeAllItems()
+            items.forEach(serverCombo::addItem)
+            serverCombo.selectedItem = target
+        } finally {
+            rebuildingBar = false
+        }
         if (target?.id != filter.serverId) filter.serverId = target?.id
 
-        // Jenkins selection above the jobs, lights and filters (job filters | folder filter) below.
+        // Jenkins selection above the jobs, filters (job filters | folder filter) and lights below.
         jobs.setServerSelector(serverCombo.takeIf { items.size > 1 })
         serverStatus.isVisible = JenkSpotterSettings.getInstance().current.servers.isNotEmpty()
         updateServerStatus(BuildMonitorService.getInstance().snapshot, force = true)
@@ -162,7 +172,7 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
         filterBar.repaint()
     }
 
-    /** "New Filter..." and every existing rule with enable/disable, edit, switch mode and remove. */
+    /** "New Filter..." and every existing rule with its state (green / red / off), edit and remove. */
     private fun filterMenu() = JBPopupMenu().apply {
         val settings = JenkSpotterSettings.getInstance()
         add(menuItem(JenkSpotterBundle.message("filter.new"), AllIcons.General.Add) { editFilter(null) })
@@ -170,21 +180,22 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
         val filters = settings.current.filters
         if (filters.isNotEmpty()) addSeparator()
         for (f in filters) {
-            val prefix = if (f.mode == FilterMode.INCLUDE) "+" else "\u2212"
-            add(javax.swing.JMenu("$prefix ${f.label}").apply {
-                if (!f.enabled || f.regexOrNull() == null) foreground = com.intellij.util.ui.UIUtil.getInactiveTextColor()
+            val state = ChipState.of(f)
+            add(javax.swing.JMenu(f.label).apply {
+                foreground = when {
+                    state == ChipState.OFF || f.regexOrNull() == null -> com.intellij.util.ui.UIUtil.getInactiveTextColor()
+                    state == ChipState.INCLUDE -> FilterChip.INCLUDE_COLOR
+                    else -> FilterChip.EXCLUDE_COLOR
+                }
                 if (f.regexOrNull() != null) {
-                    add(menuItem(JenkSpotterBundle.message(if (f.enabled) "filter.disable" else "filter.enable"), null) { settings.setFilterEnabled(f.id, !f.enabled) })
+                    for (s in chipStates(f)) {
+                        add(javax.swing.JCheckBoxMenuItem(JenkSpotterBundle.message(s.key), s == state).apply { addActionListener { setState(f, s) } })
+                    }
+                    addSeparator()
                 }
                 add(menuItem(JenkSpotterBundle.message("filter.edit"), AllIcons.Actions.Edit) {
                     if (f.isFolderRule) FolderFilterDialog.open(project) else editFilter(f)
                 })
-                if (!f.isFolderRule) {
-                    val toInclude = f.mode == FilterMode.EXCLUDE
-                    add(menuItem(JenkSpotterBundle.message(if (toInclude) "filter.switch.toInclude" else "filter.switch.toExclude"), null) {
-                        settings.saveFilter(f.copy().apply { mode = if (toInclude) FilterMode.INCLUDE else FilterMode.EXCLUDE })
-                    })
-                }
                 addSeparator()
                 add(menuItem(JenkSpotterBundle.message("filter.remove"), AllIcons.General.Remove) { settings.removeFilter(f.id) })
             })
@@ -202,11 +213,11 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
             mode = FilterMode.INCLUDE
             enabled = settings.current.projectJobsOnly
         }
-        return FilterChip(
+        return FilterChip.of(
             rule,
-            onToggle = { on -> settings.updateView { projectJobsOnly = on } },
+            states = listOf(ChipState.INCLUDE, ChipState.OFF),
+            onState = { s -> settings.updateView { projectJobsOnly = s == ChipState.INCLUDE } },
             onEdit = null,
-            onSwitchMode = null,
             onRemove = null,
             tooltip = "<html>" + JenkSpotterBundle.message("filter.project.tooltip") + "<br>" + JenkSpotterBundle.message("filter.chip.help") + "</html>",
         )
@@ -214,15 +225,26 @@ class JenkSpotterMainPanel(private val project: Project) : JPanel(BorderLayout()
 
     private fun filterChip(f: RegexFilter): JComponent {
         val settings = JenkSpotterSettings.getInstance()
-        return FilterChip(
+        return FilterChip.of(
             f,
-            onToggle = { settings.setFilterEnabled(f.id, it) },
+            states = chipStates(f),
+            onState = { setState(f, it) },
             onEdit = { if (f.isFolderRule) FolderFilterDialog.open(project) else editFilter(f) },
-            onSwitchMode = if (f.isFolderRule) null else {
-                { settings.saveFilter(f.copy().apply { mode = if (mode == FilterMode.INCLUDE) FilterMode.EXCLUDE else FilterMode.INCLUDE }) }
-            },
             onRemove = { settings.removeFilter(f.id) },
         )
+    }
+
+    /** Green, red, off; the folder overview only hides, so it has no green. */
+    private fun chipStates(f: RegexFilter) =
+        if (f.isFolderRule) listOf(ChipState.EXCLUDE, ChipState.OFF) else listOf(ChipState.INCLUDE, ChipState.EXCLUDE, ChipState.OFF)
+
+    private fun setState(f: RegexFilter, state: ChipState) {
+        val settings = JenkSpotterSettings.getInstance()
+        when (state) {
+            ChipState.INCLUDE -> settings.setFilterState(f.id, true, FilterMode.INCLUDE)
+            ChipState.EXCLUDE -> settings.setFilterState(f.id, true, FilterMode.EXCLUDE)
+            ChipState.OFF -> settings.setFilterState(f.id, false)
+        }
     }
 
     private fun editFilter(existing: RegexFilter?) = FilterActions.edit(project, existing)
@@ -279,8 +301,9 @@ class RegexFilterDialog(
     private val base = existing?.copy() ?: RegexFilter()
     private val nameField = JBTextField(base.name, 20)
     private val patternField = JBTextField(base.pattern, 36)
-    private val excludeRadio = com.intellij.ui.components.JBRadioButton(JenkSpotterBundle.message("filter.mode.exclude"), base.mode == FilterMode.EXCLUDE)
-    private val includeRadio = com.intellij.ui.components.JBRadioButton(JenkSpotterBundle.message("filter.mode.include"), base.mode == FilterMode.INCLUDE)
+    private val excludeRadio = com.intellij.ui.components.JBRadioButton(JenkSpotterBundle.message("filter.mode.exclude"), base.enabled && base.mode == FilterMode.EXCLUDE)
+    private val includeRadio = com.intellij.ui.components.JBRadioButton(JenkSpotterBundle.message("filter.mode.include"), base.enabled && base.mode == FilterMode.INCLUDE)
+    private val offRadio = com.intellij.ui.components.JBRadioButton(JenkSpotterBundle.message("filter.state.off"), !base.enabled)
     private val kindCombo = ComboBox(BuilderKind.entries.toTypedArray())
     private val textField = JBTextField(16)
     private val preview = com.intellij.ui.components.JBLabel().apply {
@@ -307,9 +330,10 @@ class RegexFilterDialog(
 
     init {
         title = JenkSpotterBundle.message(if (isNew) "filter.dialog.titleNew" else "filter.dialog.titleEdit")
-        javax.swing.ButtonGroup().apply { add(excludeRadio); add(includeRadio) }
+        javax.swing.ButtonGroup().apply { add(includeRadio); add(excludeRadio); add(offRadio) }
         excludeRadio.addActionListener { updatePreview() }
         includeRadio.addActionListener { updatePreview() }
+        offRadio.addActionListener { updatePreview() }
         patternField.document.addDocumentListener(object : com.intellij.ui.DocumentAdapter() {
             override fun textChanged(e: javax.swing.event.DocumentEvent) = updatePreview()
         })
@@ -320,7 +344,7 @@ class RegexFilterDialog(
     override fun createCenterPanel(): JComponent = panel {
         row(JenkSpotterBundle.message("filter.dialog.name")) { cell(nameField).align(AlignX.FILL) }
         row(JenkSpotterBundle.message("filter.dialog.mode")) {
-            cell(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply { add(excludeRadio); add(includeRadio) })
+            cell(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply { add(includeRadio); add(excludeRadio); add(offRadio) })
         }
             .rowComment(JenkSpotterBundle.message("filter.dialog.modeHint"))
         group(JenkSpotterBundle.message("filter.builder.title")) {
@@ -370,7 +394,7 @@ class RegexFilterDialog(
             regex == null -> JenkSpotterBundle.message("filter.invalid")
             sampleJobs.isEmpty() -> ""
             else -> {
-                val hidden = HiddenJobs.of(otherFilters + result().apply { enabled = true })
+                val hidden = HiddenJobs.of(otherFilters + result())
                 val remaining = sampleJobs.count { !hidden.isHidden(it) }
                 JenkSpotterBundle.message("filter.remaining", remaining, sampleJobs.size)
             }
@@ -388,7 +412,9 @@ class RegexFilterDialog(
     fun result(): RegexFilter = base.copy().apply {
         name = nameField.text.trim().ifEmpty { patternField.text.trim() }
         pattern = patternField.text.trim()
-        mode = if (includeRadio.isSelected) FilterMode.INCLUDE else FilterMode.EXCLUDE
+        // Off keeps the last mode, so the rule comes back as it was.
+        enabled = !offRadio.isSelected
+        if (enabled) mode = if (includeRadio.isSelected) FilterMode.INCLUDE else FilterMode.EXCLUDE
     }
 
     companion object {

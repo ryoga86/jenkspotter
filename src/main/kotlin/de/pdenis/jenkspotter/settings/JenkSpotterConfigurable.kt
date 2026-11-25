@@ -92,7 +92,6 @@ class JenkSpotterConfigurable : Configurable {
     private val historyHours = JSpinner(SpinnerNumberModel(24, 1, 24 * 14, 1))
     private val buildsPerPin = JSpinner(SpinnerNumberModel(5, 1, 50, 1))
     private val recentBuilds = JSpinner(SpinnerNumberModel(10, 1, 100, 1))
-    private val wizardingMode = JBCheckBox(JenkSpotterBundle.message("settings.wizardingMode"))
 
     override fun getDisplayName() = "JenkSpotter"
 
@@ -152,7 +151,7 @@ class JenkSpotterConfigurable : Configurable {
         fun preview(result: BuildResult, field: TextFieldWithBrowseButton) = JButton(JenkSpotterBundle.message("settings.preview")).apply {
             addActionListener {
                 // Preview with the values currently in the form, not the saved ones.
-                SoundPlayer.playWith(result, field.text.trim(), volume.value, wizardingMode.isSelected)
+                SoundPlayer.playWith(result, field.text.trim(), volume.value)
             }
         }
         fun row(vararg components: JComponent) = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply { components.forEach(::add) }
@@ -176,7 +175,6 @@ class JenkSpotterConfigurable : Configurable {
             .addLabeledComponent(JenkSpotterBundle.message("settings.buildsPerPin"), buildsPerPin)
             .addLabeledComponent(JenkSpotterBundle.message("settings.recentBuilds"), recentBuilds)
             .addLabeledComponent(JenkSpotterBundle.message("settings.browserUi"), browserUi)
-            .addComponent(wizardingMode)
             .panel
 
         reset()
@@ -308,7 +306,6 @@ class JenkSpotterConfigurable : Configurable {
             ownHistoryHours = historyHours.value as Int
             buildsPerPinnedJob = buildsPerPin.value as Int
             recentBuildsCount = recentBuilds.value as Int
-            wizardingMode = this@JenkSpotterConfigurable.wizardingMode.isSelected
         }
     }
 
@@ -324,11 +321,17 @@ class JenkSpotterConfigurable : Configurable {
         next.recentJobs = live.recentJobs.filter { key -> next.servers.any { key.startsWith(it.id + " ") } }.toMutableList()
         next.rememberedParameters = live.rememberedParameters.toMutableMap(); next.rememberParameters = live.rememberParameters
         next.buildColumns = live.buildColumns; next.buildColumnWidths = live.buildColumnWidths; next.showJobPath = live.showJobPath
-        next.showFolderEntries = live.showFolderEntries; next.showDownstream = live.showDownstream; next.showChainStep = live.showChainStep; next.chainStepIcon = live.chainStepIcon; next.chainDisplay = live.chainDisplay
+        next.showFolderEntries = live.showFolderEntries; next.showTriggers = live.showTriggers; next.showWorkflowColors = live.showWorkflowColors; next.highlightChainOnHover = live.highlightChainOnHover
         next.showBuildJobFolders = live.showBuildJobFolders; next.jobSort = live.jobSort; next.pinnedFirst = live.pinnedFirst
         next.jobLayout = live.jobLayout; next.collapsedServers = live.collapsedServers.toMutableList()
         next.collapsedFolders = live.collapsedFolders.toMutableList(); next.buildInfoCollapsed = live.buildInfoCollapsed
-        next.jobIcon = live.jobIcon; next.followUpIcon = live.followUpIcon; next.visibilityToggle = live.visibilityToggle; next.showAllRunning = live.showAllRunning; next.projectJobsOnly = live.projectJobsOnly; next.hiddenServers = live.hiddenServers.toMutableList(); next.hiddenStatuses = live.hiddenStatuses.toMutableList()
+        next.showAllRunning = live.showAllRunning; next.allBuildsHistory = live.allBuildsHistory; next.projectJobsOnly = live.projectJobsOnly; next.hiddenServers = live.hiddenServers.toMutableList(); next.buildChips = live.buildChips.toMutableList(); next.buildsPageSize = live.buildsPageSize; next.buildSort = live.buildSort; next.chainView = live.chainView
+        // Nothing of a removed Jenkins stays behind.
+        val kept = next.servers.map { it.id }.toSet()
+        next.hiddenServers.retainAll(kept)
+        next.collapsedServers.retainAll(kept)
+        next.collapsedFolders.retainAll { it.substringBefore(' ') in kept }
+        next.rememberedParameters.keys.retainAll { it.substringBefore(' ') in kept }
         val removed = settings.current.servers.map { it.id } - next.servers.map { it.id }.toSet()
         removed.forEach { id ->
             TokenStore.set(id, "", null)
@@ -368,7 +371,6 @@ class JenkSpotterConfigurable : Configurable {
         historyHours.value = working.ownHistoryHours
         buildsPerPin.value = working.buildsPerPinnedJob
         recentBuilds.value = working.recentBuildsCount
-        wizardingMode.isSelected = working.wizardingMode
         if (serverModel.isEmpty) showServer(null) else serverList.selectedIndex = 0
         loadTokensAsync(working.servers.map { it.id })
     }

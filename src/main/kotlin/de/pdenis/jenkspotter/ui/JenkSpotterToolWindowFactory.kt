@@ -43,6 +43,6 @@ class JenkSpotterToolWindowFactory : ToolWindowFactory, DumbAware {
     }
 
     companion object {
-        const val STRIPE_TITLE = "Jenk Spotter"
+        const val STRIPE_TITLE = "JenkSpotter"
     }
 }

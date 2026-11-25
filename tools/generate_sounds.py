@@ -39,21 +39,6 @@ def mix(*tracks: tuple[float, list[float]]) -> list[float]:
     return out
 
 
-def howler(length: float = 1.3) -> list[float]:
-    """A falling, trembling shriek for failed builds in Wizarding Mode."""
-    samples, phase = [], 0.0
-    for i in range(int(length * RATE)):
-        t = i / RATE
-        freq = 900 * math.exp(-1.1 * t) + 180
-        phase += 2 * math.pi * freq / RATE
-        tremolo = 0.6 + 0.4 * math.sin(2 * math.pi * 11 * t)
-        envelope = min(1.0, t / 0.03) * math.exp(-1.6 * t)
-        # A few odd harmonics make it sound like a voice rather than a sine.
-        tone = math.sin(phase) + 0.4 * math.sin(3 * phase) + 0.2 * math.sin(5 * phase)
-        samples.append(envelope * tremolo * tone)
-    return samples
-
-
 def write(name: str, samples: list[float], peak: float = 0.8) -> None:
     fade = int(0.02 * RATE)
     for i in range(min(fade, len(samples))):
@@ -72,7 +57,6 @@ def main() -> None:
     write("success.wav", mix((0.0, bell(1046.5, 1.2, 5.0)), (0.13, bell(1568.0, 1.4, 4.5))))
     write("failure.wav", mix((0.0, bell(784.0, 1.0, 5.5)), (0.22, bell(523.3, 1.5, 4.0))))
     write("aborted.wav", bell(440.0, 0.7, 9.0), peak=0.55)
-    write("howler.wav", howler(), peak=0.7)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ class JenkSpotterStatusBarWidgetFactory : StatusBarWidgetFactory {
     override fun createWidget(project: Project): StatusBarWidget = JenkSpotterStatusBarWidget(project)
 }
 
-/** Butler head whose scar colour shows the overall state, plus "running / failing" counters. */
+/** Butler head whose bow tie colour shows the overall state, plus "running / failing" counters. */
 class JenkSpotterStatusBarWidget(private val project: Project) : CustomStatusBarWidget {
     @Volatile
     private var disposed = false

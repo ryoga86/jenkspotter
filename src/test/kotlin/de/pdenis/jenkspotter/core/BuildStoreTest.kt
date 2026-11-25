@@ -157,16 +157,59 @@ class BuildStoreTest {
     }
 
     @Test
-    fun `builds listed only as running disappear when they leave the executors`() {
+    fun `builds listed only as running stay listed when they leave the executors`() {
         val store = BuildStore()
         val other = build("other", 1, BuildResult.RUNNING, user = "bob")
         val pinnedToo = build("pinned", 2, BuildResult.RUNNING, user = "bob")
         store.upsert("s", other, BuildSource.RUNNING, "alice")
         store.upsert("s", pinnedToo, BuildSource.RUNNING, "alice")
         store.upsert("s", pinnedToo, BuildSource.PINNED, "alice")
-        store.retainRunning("s", setOf(other.url, pinnedToo.url))
+        assertEquals(emptyList<TrackedBuild>(), store.endedRunning("s", setOf(other.url, pinnedToo.url)))
+
+        // Both left the executors: the running-only one is returned to fetch its result, nothing is dropped.
+        assertEquals(listOf(other.url), store.endedRunning("s", emptySet()).map { it.build.url })
         assertEquals(2, store.all().size)
-        store.retainRunning("s", emptySet())
-        assertEquals(listOf(setOf(BuildSource.PINNED)), store.all().map { it.sources })
+        assertEquals(setOf(BuildSource.PINNED), store.all().first { it.build.url == pinnedToo.url }.sources)
+
+        // With its result it is finished and is not asked for again.
+        store.upsert("s", build("other", 1, BuildResult.SUCCESS, user = "bob"), BuildSource.RUNNING, "alice")
+        assertEquals(emptyList<TrackedBuild>(), store.endedRunning("s", emptySet()))
+        assertEquals(BuildResult.SUCCESS, store.all().first { it.build.url == other.url }.build.result)
+
+        store.dropRunningOnly("s")
+        assertEquals(listOf(pinnedToo.url), store.all().map { it.build.url })
+    }
+
+    @Test
+    fun `finished builds listed only as running are pruned like the own history`() {
+        val now = System.currentTimeMillis()
+        val store = BuildStore()
+        store.upsert("s", build("old", 1, BuildResult.SUCCESS, ts = 0, user = "bob"), BuildSource.RUNNING, "alice")
+        store.upsert("s", build("new", 1, BuildResult.SUCCESS, ts = now - 1000, user = "bob"), BuildSource.RUNNING, "alice")
+        store.prune(hours = 1)
+        assertEquals(listOf("new"), store.all().map { it.build.jobFullName })
+    }
+
+    @Test
+    fun `retainHistory drops builds that left the latest ones but keeps other sources`() {
+        val store = BuildStore()
+        store.upsert("s", build("a", 1, BuildResult.SUCCESS, user = "bob"), BuildSource.HISTORY, "alice")
+        store.upsert("s", build("b", 1, BuildResult.FAILURE, user = "bob"), BuildSource.HISTORY, "alice")
+        store.upsert("s", build("b", 1, BuildResult.FAILURE, user = "bob"), BuildSource.PINNED, "alice")
+        store.upsert("s", build("c", 1, BuildResult.SUCCESS, user = "bob"), BuildSource.HISTORY, "alice")
+        store.retainHistory("s", setOf("https://ci/job/c/1/"))
+        assertNull(store.get("s", "https://ci/job/a/1/"))
+        assertEquals(setOf(BuildSource.PINNED), store.get("s", "https://ci/job/b/1/")!!.sources)
+        assertEquals(setOf(BuildSource.HISTORY), store.get("s", "https://ci/job/c/1/")!!.sources)
+    }
+
+    @Test
+    fun `slow poll keeps the builds of a job that could not be asked`() {
+        val store = BuildStore()
+        store.applySlowPoll("s", listOf(build("a", 1, BuildResult.SUCCESS) to BuildSource.PINNED, build("b", 1, BuildResult.SUCCESS) to BuildSource.PINNED), null)
+        // Job a failed to answer this time, job b answered with nothing.
+        store.applySlowPoll("s", emptyList(), null) { tracked, source -> source == BuildSource.PINNED && tracked.build.jobFullName == "a" }
+        assertNotNull(store.get("s", "https://ci/job/a/1/"))
+        assertNull(store.get("s", "https://ci/job/b/1/"))
     }
 }

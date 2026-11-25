@@ -50,7 +50,10 @@ class LogConsoleManager(private val project: Project, private val cs: CoroutineS
         val console = TextConsoleBuilderFactory.getInstance().createBuilder(project).console
         val panel = SimpleToolWindowPanel(false, true)
         panel.setContent(console.component)
+        val errors = LogErrorNavigator(console)
         val actions = DefaultActionGroup().apply {
+            addAll(errors.actions())
+            addSeparator()
             addAll(*console.createConsoleActions())
             addSeparator()
             add(object : DumbAwareAction(JenkSpotterBundle.message("action.openInBrowser"), null, AllIcons.General.Web) {
@@ -91,7 +94,7 @@ class LogConsoleManager(private val project: Project, private val cs: CoroutineS
         }
         content.putUserData(SCROLLER_KEY, scroll)
         val job = cs.launch {
-            tail(build, console) { part ->
+            tail(build, console, errors) { part ->
                 text.append(part)
                 pendingScroll?.let(scroll)
             }
@@ -102,7 +105,7 @@ class LogConsoleManager(private val project: Project, private val cs: CoroutineS
     private fun current(build: TrackedBuild): TrackedBuild =
         BuildMonitorService.getInstance().snapshot.builds.firstOrNull { it.key == build.key } ?: build
 
-    private suspend fun tail(build: TrackedBuild, console: ConsoleView, printed: (String) -> Unit) {
+    private suspend fun tail(build: TrackedBuild, console: ConsoleView, errors: LogErrorNavigator, printed: (String) -> Unit) {
         val decoder = AnsiEscapeDecoder()
         var offset = 0L
         try {
@@ -118,6 +121,7 @@ class LogConsoleManager(private val project: Project, private val cs: CoroutineS
                             console.print(part, ConsoleViewContentType.getConsoleViewType(key))
                             printed(part)
                         }
+                        errors.scan()
                     }
                 }
                 if (!chunk.hasMore) break
@@ -138,10 +142,7 @@ class LogConsoleManager(private val project: Project, private val cs: CoroutineS
         private val BUILD_URL_KEY = com.intellij.openapi.util.Key.create<String>("JenkSpotter.buildUrl")
         private val SCROLLER_KEY = com.intellij.openapi.util.Key.create<(String) -> Unit>("JenkSpotter.scroller")
 
-        // Jenkins embeds hyperlink metadata as concealed "ha:" blobs that would show up as noise.
-        private val CONSOLE_NOTE = Regex("\u001B\\[8mha:[^\u001B]*\u001B\\[0m")
-
-        fun stripConsoleNotes(text: String): String = text.replace(CONSOLE_NOTE, "").replace("\r\n", "\n")
+        fun stripConsoleNotes(text: String): String = de.pdenis.jenkspotter.core.LogErrors.stripConsoleNotes(text)
 
         fun getInstance(project: Project): LogConsoleManager = project.service()
     }

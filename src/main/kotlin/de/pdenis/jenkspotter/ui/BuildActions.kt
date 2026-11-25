@@ -82,6 +82,7 @@ object BuildActions {
                         project, JenkinsPaths.displayName(fullName), definitions, initial, form,
                         cascade = { name, referenced -> client.cascadeChoices(form, name, referenced) },
                         rememberByDefault = settings.current.rememberParameters,
+                        serverName = settings.server(serverId)?.displayName,
                     ).takeIf { it.showAndGet() }
                 } ?: return@runReporting
                 val values = dialog.values()

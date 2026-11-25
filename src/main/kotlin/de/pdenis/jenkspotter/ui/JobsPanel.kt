@@ -40,11 +40,6 @@ import de.pdenis.jenkspotter.core.JobIndexService
 import de.pdenis.jenkspotter.core.MonitorSnapshot
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
 import de.pdenis.jenkspotter.settings.JobLayout
-import de.pdenis.jenkspotter.settings.JobIcon
-import de.pdenis.jenkspotter.settings.FollowUpIcon
-import de.pdenis.jenkspotter.settings.ChainStepIcon
-import de.pdenis.jenkspotter.settings.ChainDisplay
-import de.pdenis.jenkspotter.settings.VisibilityToggle
 import de.pdenis.jenkspotter.settings.JobSort
 import com.intellij.ui.awt.RelativePoint
 import com.intellij.openapi.ui.popup.JBPopupFactory
@@ -66,21 +61,17 @@ import javax.swing.event.DocumentEvent
 /** Row of the jobs list: a collapsible Jenkins or folder node (tree layouts) or a job. */
 sealed class JobRow {
     data class Server(val serverId: String, val count: Int, val collapsed: Boolean) : JobRow()
-    data class Folder(val serverId: String, val path: String, val count: Int, val collapsed: Boolean, val depth: Int) : JobRow()
+    /** [multiBranch]: the folder is a multibranch pipeline, its jobs are branches. */
+    /** [path]: shown name (relative to [JobsPanel]'s folder scope); [key]: full display path, for the collapsed state. */
+    data class Folder(
+        val serverId: String, val path: String, val count: Int, val collapsed: Boolean, val depth: Int,
+        val multiBranch: Boolean = false, val fullName: String = "", val key: String = path,
+    ) : JobRow()
     /**
      * [folder]: path of the folder node the job is listed under; [depth]: nesting level;
-     * [chainDepth], [expanded], [lane]: see [JobHitRenderer].
+     * [branch]: a branch below its multibranch pipeline node, drawn with a tree connector.
      */
-    data class Job(
-        val hit: JobHit,
-        val folder: String? = null,
-        val depth: Int = 0,
-        val chainDepth: Int = 0,
-        val expanded: Boolean? = null,
-        val lane: JobHitRenderer.Lane = JobHitRenderer.Lane.NONE,
-        val laneDashedIn: Boolean = false,
-        val laneDashedOut: Boolean = false,
-    ) : JobRow()
+    data class Job(val hit: JobHit, val folder: String? = null, val depth: Int = 0, val branch: JobHitRenderer.Connector? = null) : JobRow()
 }
 
 /** Fuzzy search (RepoLeap style) over the locally indexed jobs, with build / pin / watch / open actions. */
@@ -99,18 +90,24 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     private val alarm = Alarm(Alarm.ThreadToUse.POOLED_THREAD, this)
     private val renderer = Renderer()
 
-    /** Session state of [ChainDisplay.TREE]: "serverId url" of jobs whose follow-ups are shown. */
-    private val expandedChains = HashSet<String>()
+    /** Folder or multibranch pipeline the list is narrowed to (double-click), null = every job. */
+    private data class FolderScope(val serverId: String, val fullName: String, val multiBranch: Boolean)
+    private var scope: FolderScope? = null
 
-    /** [ChainDisplay.HIGHLIGHT]: "serverId url" of the jobs before / after the selected one. */
+    /** Above the list while narrowed to a folder: its path as breadcrumbs and a button back to all jobs. */
+    private val scopeBar = JPanel(BorderLayout()).apply {
+        isVisible = false
+        border = JBUI.Borders.compound(JBUI.Borders.customLineBottom(JBUI.CurrentTheme.ToolWindow.borderColor()), JBUI.Borders.empty(2, 6))
+    }
+
+    /** Job under the mouse whose triggers are tinted, as "serverId url". */
+    private var hovered: String? = null
+
+    /** "serverId url" of the jobs triggering / triggered by the [hovered] one, directly or not. */
     private var related: Map<String, JobHitRenderer.Relation> = emptyMap()
 
-    /** [ChainDisplay.HIGHLIGHT]: the selected job's chain as clickable names below the list. */
-    private val chainPath = JPanel(com.intellij.util.ui.WrapLayout(java.awt.FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
-        border = JBUI.Borders.empty(2, 6)
-        isVisible = false
-        toolTipText = JenkSpotterBundle.message("chain.path.hint")
-    }
+    /** Search text the listed rows belong to; while typing the list lags a moment behind the field. */
+    private var shownQuery: String? = null
 
     /** Job to select once it shows up in the results, see [reveal]. */
     private var pendingReveal: Pair<String, String>? = null
@@ -127,6 +124,10 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     init {
         list.selectionMode = ListSelectionModel.SINGLE_SELECTION
         list.cellRenderer = renderer
+        // Fixed cell size: otherwise Swing renders every one of several thousand rows to measure it.
+        // Rows wider than the view are shown in full on hover (expandable items of JBList).
+        list.fixedCellHeight = maxOf(list.getFontMetrics(list.font).height + JBUI.scale(4), JBUI.scale(22))
+        list.fixedCellWidth = JBUI.scale(120)
         list.emptyText.text = JenkSpotterBundle.message("jobs.empty")
         search.textEditor.emptyText.text = JenkSpotterBundle.message("jobs.searchHint")
 
@@ -137,22 +138,21 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
                 isOpaque = false
                 // As wide as its longest Jenkins name, not stretched when the view gets wider.
                 add(selectorSlot, BorderLayout.WEST)
-                add(toolbarComponent, BorderLayout.EAST)
+                add(toolbarComponent, BorderLayout.CENTER)
             }, BorderLayout.NORTH)
             add(search, BorderLayout.CENTER)
         }
         toolbar = header
         setContent(JPanel(BorderLayout()).apply {
+            add(scopeBar, BorderLayout.NORTH)
             add(JBScrollPane(list), BorderLayout.CENTER)
             add(JPanel(BorderLayout()).apply {
                 border = JBUI.Borders.customLineTop(JBUI.CurrentTheme.ToolWindow.borderColor())
-                add(chainPath, BorderLayout.NORTH)
                 add(bottomSlot, BorderLayout.CENTER)
                 add(statusLabel, BorderLayout.SOUTH)
             }, BorderLayout.SOUTH)
         })
 
-        list.addListSelectionListener { if (!it.valueIsAdjusting) updateChainHighlight() }
         search.addDocumentListener(object : DocumentAdapter() {
             override fun textChanged(e: DocumentEvent) = scheduleSearch(keepSelection = false)
         })
@@ -171,10 +171,15 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
                     // A pasted Jenkins URL is pinned instead of searched for.
                     KeyEvent.VK_ENTER -> {
                         if (search.text.trim().startsWith("http") && PinFromUrl.pin(project, search.text)) search.text = ""
-                        else activate()
+                        // The list lags a moment behind the typing: Enter must not build what was found for the text before.
+                        else if (search.text == shownQuery) activate()
                         true
                     }
-                    KeyEvent.VK_ESCAPE -> if (search.text.isNotEmpty()) { search.text = ""; true } else false
+                    KeyEvent.VK_ESCAPE -> when {
+                        search.text.isNotEmpty() -> { search.text = ""; true }
+                        scope != null -> { clearScope(); true }
+                        else -> false
+                    }
                     else -> false
                 }
                 if (handled) e.consume()
@@ -196,23 +201,45 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
                 if (handled) e.consume()
             }
         })
-        // A single click on a Jenkins or folder node opens or closes it.
+        // A single click on a Jenkins node opens or closes it; a folder node only via its arrow,
+        // since a double-click on it narrows the list to the folder.
         list.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (e.button != MouseEvent.BUTTON1 || e.clickCount != 1) return
                 val index = list.locationToIndex(e.point).takeIf { it >= 0 && list.getCellBounds(it, it)?.contains(e.point) == true } ?: return
                 val row = listModel.get(index)
                 if (row is JobRow.Job) {
-                    // Jobs only open and close via their arrow; a click elsewhere selects them.
-                    val bounds = list.getCellBounds(index, index)
-                    val arrowEnd = bounds.x + JBUI.scale(2 + row.depth * GROUP_INDENT + row.chainDepth * 16 + 18)
+                    if (onChainsBadge(index, e.point)) showChains(row.hit, RelativePoint(e))
+                    return
+                }
+                if (row is JobRow.Folder) {
+                    val arrowEnd = list.getCellBounds(index, index).x + JBUI.scale(2 + row.depth * GROUP_INDENT + 20)
                     if (e.x > arrowEnd) return
                 }
                 collapsed(row)?.let { setCollapsed(row, !it) }
             }
         })
+        list.addMouseMotionListener(object : MouseAdapter() {
+            override fun mouseMoved(e: MouseEvent) {
+                val index = list.locationToIndex(e.point)
+                val bounds = if (index >= 0) list.getCellBounds(index, index)?.takeIf { it.contains(e.point) } else null
+                val hand = bounds != null && onChainsBadge(index, e.point)
+                list.cursor = if (hand) java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR) else null
+                hover(bounds?.let { (listModel.get(index) as? JobRow.Job)?.hit })
+            }
+        })
+        list.addMouseListener(object : MouseAdapter() {
+            override fun mouseExited(e: MouseEvent) = hover(null)
+        })
         object : DoubleClickListener() {
             override fun onDoubleClick(event: MouseEvent): Boolean {
+                // A double click on the chains badge only opens the chains, it does not build.
+                val index = list.locationToIndex(event.point)
+                if (index >= 0 && onChainsBadge(index, event.point)) return true
+                (list.selectedValue as? JobRow.Folder)?.let {
+                    scopeTo(it.serverId, it.fullName)
+                    return true
+                }
                 selected()?.let(::trigger) ?: return false
                 return true
             }
@@ -225,14 +252,22 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
                 val bounds = list.getCellBounds(index, index) ?: return@action
                 RecentBuildsPopup.show(project, hit.serverId, hit.job.url, hit.job.fullName, RelativePoint(list, java.awt.Point(bounds.x + JBUI.scale(24), bounds.y + bounds.height)))
             })
-            add(chainGroup())
+            add(action("action.showChains", AllIcons.Vcs.Merge, { selected()?.let { ChainsPopup.hasChains(it.serverId, it.job) } == true }) {
+                val hit = selected() ?: return@action
+                val bounds = list.getCellBounds(list.selectedIndex, list.selectedIndex) ?: return@action
+                showChains(hit, RelativePoint(list, java.awt.Point(bounds.x + JBUI.scale(24), bounds.y + bounds.height)))
+            })
+            add(action("jobs.scope.enter", AllIcons.Nodes.Folder, { scopeTarget() != null }) {
+                scopeTarget()?.let { (serverId, fullName) -> scopeTo(serverId, fullName) }
+            })
             addSeparator()
             add(FilterActions.group(project) { selected()?.job?.fullName })
             addSeparator()
             add(object : DefaultActionGroup({ JenkSpotterBundle.message("jobs.server") }, true) {
                 override fun getChildren(e: AnActionEvent?): Array<AnAction> {
                     val id = selectedServerId() ?: return AnAction.EMPTY_ARRAY
-                    return ServerStatusUi.actions(project, id).getChildren(e)
+                    // getChildren(e) is override-only API; the group holds plain actions, no stubs.
+                    return ServerStatusUi.actions(project, id).childActionsOrStubs
                 }
                 override fun update(e: AnActionEvent) {
                     val id = selectedServerId()
@@ -268,13 +303,14 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
         scheduleSearch(keepSelection = true)
     }
 
-    /** Narrow enough to drag, wide enough that the toolbar and the whole Jenkins selection stay visible. */
+    /** Narrow enough to drag, wide enough for the Jenkins selection and the first toolbar buttons. */
     override fun getMinimumSize(): java.awt.Dimension {
         // Swing asks during construction, before the fields are set.
         @Suppress("SENSELESS_COMPARISON")
         if (toolbarComponent == null || selectorSlot == null) return super.getMinimumSize()
+        // Room for the Jenkins selection and a few buttons; the toolbar folds the rest into its ">>" menu.
         val selector = selectorSlot.takeIf { it.isVisible }?.let { it.preferredSize.width + JBUI.scale(4) } ?: 0
-        return java.awt.Dimension(toolbarComponent.preferredSize.width + selector + JBUI.scale(8), super.getMinimumSize().height)
+        return java.awt.Dimension(selector + JBUI.scale(140), super.getMinimumSize().height)
     }
 
     fun setServerSelector(component: JComponent?) {
@@ -301,9 +337,9 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
      */
     fun reveal(serverId: String, url: String, query: String) {
         pendingReveal = serverId to url
-        // Tree display: open the jobs above it, so a nested follow-up job is listed.
-        JobIndexService.getInstance().jobByUrl(serverId, url)?.let { job ->
-            JobIndexService.getInstance().position(serverId, job)?.path?.forEach { expandedChains += "$serverId ${it.url}" }
+        scope?.let { s ->
+            val fullName = JobIndexService.getInstance().jobByUrl(serverId, url)?.fullName
+            if (s.serverId != serverId || fullName == null || !fullName.startsWith(s.fullName + "/")) clearScope(search = false)
         }
         val settings = JenkSpotterSettings.getInstance()
         if (serverId in settings.current.collapsedServers) settings.setServerCollapsed(serverId, false)
@@ -322,7 +358,9 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
 
     private fun scheduleSearch(keepSelection: Boolean) {
         if (disposed) return
-        val serverIds = filter.serverIds()
+        val scope = scope?.takeIf { it.serverId in filter.serverIds() }
+        if (scope == null && this.scope != null) clearScope(search = false)
+        val serverIds = scope?.let { listOf(it.serverId) } ?: filter.serverIds()
         val hidden = filter.hidden()
         val query = search.text
         val projectOnly = JenkSpotterSettings.getInstance().current.projectJobsOnly
@@ -331,7 +369,11 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
             val index = JobIndexService.getInstance()
             val repos = BranchJobs.getInstance(project).repos
             val only = if (projectOnly) serverIds.associateWith { repos.filter(index.state(it).jobs) } else null
-            val results = index.search(serverIds, query, hidden, only = only)
+            // The list shows every job; only the search popup is capped.
+            val results = index.search(serverIds, query, hidden, limit = Int.MAX_VALUE, only = only)
+                .let { found -> if (scope == null) found else found.filter { it.job.fullName.startsWith(scope.fullName + "/") } }
+            // What the rows show next to the name, worked out here so that painting is only a lookup.
+            results.forEach { index.badges(it.serverId, it.job) }
             val states = serverIds.associateWith { index.state(it) }
             val buildable = states.values.flatMap { st -> st.jobs.filter { it.isBuildable } }
             val counts = Counts(buildable.size, buildable.count { !hidden.isHidden(it.fullName) }, results.count { it.job.isBuildable }, query.isNotBlank())
@@ -343,7 +385,15 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
                         else -> "jobs.project.none"
                     },
                 )
+                // Jobs exist, but none is left: say so, with the quickest way back.
+                if (results.isEmpty() && counts.total > 0 && only == null) {
+                    list.emptyText.text = JenkSpotterBundle.message("jobs.empty.filtered", counts.total)
+                    if (query.isNotBlank()) {
+                        list.emptyText.appendSecondaryText(JenkSpotterBundle.message("jobs.empty.clearSearch"), SimpleTextAttributes.LINK_PLAIN_ATTRIBUTES) { search.text = "" }
+                    }
+                }
                 show(serverIds, results, states, counts, keepSelection)
+                shownQuery = query
             }, { disposed || project.isDisposed })
         }, SEARCH_DELAY_MS)
     }
@@ -358,8 +408,9 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     private fun show(serverIds: List<String>, results: List<JobHit>, states: Map<String, JobIndexService.IndexState>, counts: Counts, keepSelection: Boolean) {
         val previous = list.selectedValue?.let(::rowKey)
         val rows = rows(serverIds, results)
+        // One event for all rows: adding them one by one lays out the whole list per row.
         listModel.clear()
-        rows.forEach(listModel::addElement)
+        listModel.addAll(rows)
         renderer.serverNodes = serverNodes(serverIds)
 
         val reveal = pendingReveal
@@ -376,7 +427,6 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
             list.selectedIndex = index
             ScrollingUtil.ensureIndexIsVisible(list, index, 0)
         }
-        updateChainHighlight()
         val settings = JenkSpotterSettings.getInstance()
         statusLabel.text = when {
             states.isEmpty() -> JenkSpotterBundle.message("status.noServers")
@@ -393,17 +443,12 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     }
 
     /** Rows for the chosen layout; folder nodes keep the order in which their first job was found. */
-    private fun rows(serverIds: List<String>, found: List<JobHit>): List<JobRow> {
-        val view = JenkSpotterSettings.getInstance().current
-        val results = if (view.chainDisplay == ChainDisplay.LANE) chainOrder(found) else found
-        return withLanes(groupedRows(serverIds, results))
-    }
-
-    private fun groupedRows(serverIds: List<String>, results: List<JobHit>): List<JobRow> {
+    private fun rows(serverIds: List<String>, results: List<JobHit>): List<JobRow> {
         val view = JenkSpotterSettings.getInstance().current
         val withServers = serverNodes(serverIds)
         val withFolders = view.jobLayout == JobLayout.TREE_FOLDERS
-        if (!withServers && !withFolders) return mutableListOf<JobRow>().also { addJobs(it, results, null, 0) }
+        val scopePath = scope?.let { de.pdenis.jenkspotter.api.JenkinsPaths.displayName(it.fullName) }
+        if (!withServers && !withFolders) return mutableListOf<JobRow>().also { addJobs(it, results, scopePath, 0) }
         val collapsedServers = view.collapsedServers.toSet()
         val collapsedFolders = view.collapsedFolders.toSet()
         val byServer = results.groupBy { it.serverId }
@@ -420,109 +465,72 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
                 addJobs(rows, hits, null, depth)
                 continue
             }
-            // Jobs directly on the Jenkins first, then one node per folder.
-            addJobs(rows, hits.filter { it.path.isEmpty() }, "", depth)
-            for ((path, inFolder) in hits.filter { it.path.isNotEmpty() }.groupBy { it.path }) {
+            // Narrowed to a folder: its jobs count as top level, subfolders are named relative to it.
+            val top = scope?.let { de.pdenis.jenkspotter.api.JenkinsPaths.displayName(it.fullName) }.orEmpty()
+            fun relative(path: String) = if (top.isEmpty()) path else path.removePrefix(top).removePrefix("/")
+            // A folder or multibranch pipeline with jobs listed below it is its folder node, not also a job row.
+            val folderPaths = hits.map { it.path }.toSet()
+            val listed = hits.filter { !(it.job.isFolder && de.pdenis.jenkspotter.api.JenkinsPaths.displayName(it.job.fullName) in folderPaths) }
+            // Jobs directly on the Jenkins (or in the folder) first, then one node per folder.
+            addJobs(rows, listed.filter { relative(it.path).isEmpty() }, top, depth)
+            for ((path, inFolder) in listed.filter { relative(it.path).isNotEmpty() }.groupBy { it.path }) {
                 val isCollapsed = "$id $path" in collapsedFolders
-                rows += JobRow.Folder(id, path, inFolder.size, isCollapsed, depth)
-                if (!isCollapsed) addJobs(rows, inFolder, path, depth + 1)
+                val fullName = inFolder.first().job.fullName.substringBeforeLast('/')
+                val folderJob = JobIndexService.getInstance().jobByFullName(id, fullName)
+                val multiBranch = folderJob?.isMultiBranch == true
+                rows += JobRow.Folder(id, relative(path), inFolder.size, isCollapsed, depth, multiBranch, fullName, path)
+                if (!isCollapsed) addJobs(rows, inFolder, path, depth + 1, branches = multiBranch)
             }
         }
         return rows
     }
 
-    /**
-     * Adds job rows; with [ChainDisplay.TREE] follow-up jobs are nested below the job triggering
-     * them, and a triggered job is only listed on its own when the job starting its chain is not.
-     */
-    private fun addJobs(rows: MutableList<JobRow>, hits: List<JobHit>, folder: String?, depth: Int) {
-        if (JenkSpotterSettings.getInstance().current.chainDisplay != ChainDisplay.TREE) {
-            hits.mapTo(rows) { JobRow.Job(it, folder, depth) }
-            return
-        }
-        val index = JobIndexService.getInstance()
-        val listed = hits.map { it.serverId to it.job.url }.toSet()
-        fun add(hit: JobHit, chainDepth: Int, seen: Set<String>) {
-            val key = "${hit.serverId} ${hit.job.url}"
-            val next = hit.job.downstream.mapNotNull { index.jobByFullName(hit.serverId, it) }.filter { it.fullName !in seen }
-            val open = next.isNotEmpty() && key in expandedChains
-            rows += JobRow.Job(hit, folder, depth, chainDepth, if (next.isEmpty()) null else open)
-            if (open && chainDepth < 8) next.forEach { add(chainHit(hit.serverId, it), chainDepth + 1, seen + it.fullName) }
-        }
-        for (hit in hits) {
-            val root = index.position(hit.serverId, hit.job)?.path?.firstOrNull()
-            if (root != null && (hit.serverId to root.url) in listed) continue
-            add(hit, 0, setOf(hit.job.fullName))
-        }
-    }
-
-    /** A job shown because of its chain, not because it matched the search. */
-    private fun chainHit(serverId: String, job: JobRef): JobHit {
-        val settings = JenkSpotterSettings.getInstance()
-        return JobHit(
-            serverId, job,
-            de.pdenis.jenkspotter.api.JenkinsPaths.displayName(job.name),
-            de.pdenis.jenkspotter.api.JenkinsPaths.displayName(job.fullName.substringBeforeLast('/', "")),
-            de.pdenis.jenkspotter.core.JobMatcher.Result(0, emptyList(), emptyList()),
-            settings.isPinned(serverId, job.url), 0, settings.isWatched(serverId, job.url),
-        )
-    }
-
-    /** First job of the chain [hit] belongs to, null if it is in none. */
-    private fun chainRoot(hit: JobHit): JobRef? {
-        if (hit.job.isFolder) return null
-        return JobIndexService.getInstance().position(hit.serverId, hit.job)?.path?.firstOrNull()
-            ?: hit.job.takeIf { it.downstream.isNotEmpty() }
-    }
-
-    /** [ChainDisplay.LANE]: the found jobs of one chain one after another, in chain order. */
-    private fun chainOrder(results: List<JobHit>): List<JobHit> {
-        val index = JobIndexService.getInstance()
-        val byKey = results.associateBy { it.serverId to it.job.fullName }
-        val placed = HashSet<JobHit>()
-        val ordered = mutableListOf<JobHit>()
-        for (hit in results) {
-            if (hit in placed) continue
-            val root = chainRoot(hit)
-            if (root == null) {
-                placed += hit
-                ordered += hit
-                continue
+    private fun addJobs(rows: MutableList<JobRow>, hits: List<JobHit>, folder: String?, depth: Int, branches: Boolean = false) {
+        hits.mapIndexedTo(rows) { i, hit ->
+            val connector = when {
+                !branches -> null
+                i == hits.lastIndex -> JobHitRenderer.Connector.LAST
+                else -> JobHitRenderer.Connector.MIDDLE
             }
-            fun visit(fullName: String, nodes: List<de.pdenis.jenkspotter.core.ChainNode>) {
-                byKey[hit.serverId to fullName]?.takeIf { placed.add(it) }?.let(ordered::add)
-                nodes.forEach { visit(it.fullName, it.children) }
-            }
-            visit(root.fullName, index.chain(hit.serverId, root))
-            if (placed.add(hit)) ordered += hit
+            JobRow.Job(hit, folder, depth, connector)
         }
-        return ordered
     }
 
-    /** [ChainDisplay.LANE]: joins consecutive jobs of one chain with a line. */
-    private fun withLanes(rows: List<JobRow>): List<JobRow> {
-        if (JenkSpotterSettings.getInstance().current.chainDisplay != ChainDisplay.LANE) return rows
-        val keys = rows.map { row -> (row as? JobRow.Job)?.hit?.let { hit -> chainRoot(hit)?.let { hit.serverId to it.url } } }
-        // A disabled job is not triggered, nor is anything after it: the line into it is dashed.
-        val index = JobIndexService.getInstance()
-        val notTriggered = rows.map { row ->
-            val hit = (row as? JobRow.Job)?.hit ?: return@map false
-            val position = index.position(hit.serverId, hit.job)
-            position != null && (hit.job.disabled || position.blockedBy != null)
-        }
-        return rows.mapIndexed { i, row ->
-            val key = keys[i]
-            if (row !is JobRow.Job || key == null) return@mapIndexed row
-            val before = keys.getOrNull(i - 1) == key
-            val after = keys.getOrNull(i + 1) == key
-            val lane = when {
-                before && after -> JobHitRenderer.Lane.MIDDLE
-                before -> JobHitRenderer.Lane.END
-                after -> JobHitRenderer.Lane.START
-                else -> JobHitRenderer.Lane.NONE
+    /** Tints every job leading to [hit] and every job it triggers while the mouse is over it. */
+    private fun hover(hit: JobHit?) {
+        val on = hit != null && JenkSpotterSettings.getInstance().current.highlightChainOnHover
+        val key = if (on) "${hit!!.serverId} ${hit.job.url}" else null
+        if (key == hovered) return
+        hovered = key
+        val result = HashMap<String, JobHitRenderer.Relation>()
+        if (on) {
+            val index = JobIndexService.getInstance()
+            val state = index.state(hit!!.serverId)
+            val up = ArrayDeque(listOf(hit.job.fullName))
+            val seenUp = hashSetOf(hit.job.fullName)
+            while (up.isNotEmpty()) {
+                for (job in state.upstream[up.removeFirst()].orEmpty()) {
+                    if (seenUp.add(job.fullName)) {
+                        result["${hit.serverId} ${job.url}"] = JobHitRenderer.Relation.UPSTREAM
+                        up += job.fullName
+                    }
+                }
             }
-            row.copy(lane = lane, laneDashedIn = before && notTriggered[i], laneDashedOut = after && notTriggered[i + 1])
+            val down = ArrayDeque(listOf(hit.job))
+            val seenDown = hashSetOf(hit.job.fullName)
+            while (down.isNotEmpty()) {
+                for (name in down.removeFirst().downstream) {
+                    val job = index.jobByFullName(hit.serverId, name) ?: continue
+                    if (seenDown.add(name)) {
+                        result.putIfAbsent("${hit.serverId} ${job.url}", JobHitRenderer.Relation.DOWNSTREAM)
+                        down += job
+                    }
+                }
+            }
         }
+        if (result.isEmpty() && related.isEmpty()) return
+        related = result
+        list.repaint()
     }
 
     /** Prefers the first job over a Jenkins node, so Enter builds the best match. */
@@ -530,69 +538,69 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
 
     private fun rowKey(row: JobRow): Any = when (row) {
         is JobRow.Server -> row.serverId
-        is JobRow.Folder -> "${row.serverId} folder ${row.path}"
+        is JobRow.Folder -> "${row.serverId} folder ${row.key}"
         is JobRow.Job -> row.hit.serverId to row.hit.job.url
     }
 
     private fun selected(): JobHit? = (list.selectedValue as? JobRow.Job)?.hit
 
-    /** [ChainDisplay.HIGHLIGHT]: tints the jobs before and after the selected one and shows its path. */
-    private fun updateChainHighlight() {
-        val hit = selected()
-        val on = JenkSpotterSettings.getInstance().current.chainDisplay == ChainDisplay.HIGHLIGHT
-        val index = JobIndexService.getInstance()
-        val position = hit?.takeIf { on }?.let { index.position(it.serverId, it.job) }
-        val next = hit?.takeIf { on }?.job?.downstream?.mapNotNull { index.jobByFullName(hit.serverId, it) }.orEmpty()
-        if (hit == null || !on || (position == null && next.isEmpty())) {
-            if (related.isNotEmpty()) list.repaint()
-            related = emptyMap()
-            chainPath.isVisible = false
-            return
-        }
-        val state = index.state(hit.serverId)
-        val result = HashMap<String, JobHitRenderer.Relation>()
-        // Everything triggering it, on any path, and everything it triggers.
-        val queue = ArrayDeque(listOf(hit.job.fullName))
-        val seen = hashSetOf(hit.job.fullName)
-        while (queue.isNotEmpty()) {
-            for (up in state.upstream[queue.removeFirst()].orEmpty()) {
-                if (seen.add(up.fullName)) {
-                    result["${hit.serverId} ${up.url}"] = JobHitRenderer.Relation.UPSTREAM
-                    queue += up.fullName
-                }
-            }
-        }
-        // Disabled follow-ups and everything below them are not triggered.
-        fun down(nodes: List<de.pdenis.jenkspotter.core.ChainNode>, reached: Boolean) {
-            for (node in nodes) {
-                val triggered = reached && !node.disabled
-                node.url?.let { result["${hit.serverId} $it"] = if (triggered) JobHitRenderer.Relation.DOWNSTREAM else JobHitRenderer.Relation.NOT_TRIGGERED }
-                down(node.children, triggered)
-            }
-        }
-        down(index.chain(hit.serverId, hit.job), !hit.job.disabled && position?.blockedBy == null)
-        related = result
-        list.repaint()
-
-        chainPath.removeAll()
-        fun link(job: JobRef) = com.intellij.ui.components.ActionLink(
-            de.pdenis.jenkspotter.api.JenkinsPaths.displayName(job.name) + if (job.disabled) " " + JenkSpotterBundle.message("jobs.disabled") else "",
-        ) { jumpTo(hit.serverId, job) }.apply {
-            toolTipText = de.pdenis.jenkspotter.api.JenkinsPaths.displayName(job.fullName)
-            if (job.disabled) foreground = com.intellij.util.ui.UIUtil.getInactiveTextColor()
-        }
-        fun arrow() = com.intellij.ui.components.JBLabel("\u203A").apply { foreground = com.intellij.util.ui.UIUtil.getContextHelpForeground() }
-        position?.path?.forEach { chainPath.add(link(it)); chainPath.add(arrow()) }
-        chainPath.add(com.intellij.ui.components.JBLabel(hit.name).apply { font = font.deriveFont(java.awt.Font.BOLD) })
-        if (next.isNotEmpty()) chainPath.add(arrow())
-        next.forEachIndexed { i, job ->
-            if (i > 0) chainPath.add(com.intellij.ui.components.JBLabel("|").apply { foreground = com.intellij.util.ui.UIUtil.getContextHelpForeground() })
-            chainPath.add(link(job))
-        }
-        chainPath.isVisible = true
-        chainPath.revalidate()
-        chainPath.repaint()
+    /** Folder or multibranch pipeline of the selected row, as (server id, full name). */
+    private fun scopeTarget(): Pair<String, String>? = when (val row = list.selectedValue) {
+        is JobRow.Folder -> row.serverId to row.fullName
+        is JobRow.Job -> if (row.hit.job.isFolder) row.hit.serverId to row.hit.job.fullName else null
+        else -> null
     }
+
+    /** Lists only the jobs inside [fullName] (folder or multibranch pipeline), see [scopeBar]. */
+    private fun scopeTo(serverId: String, fullName: String) {
+        if (fullName.isEmpty()) return clearScope()
+        val job = JobIndexService.getInstance().jobByFullName(serverId, fullName)
+        scope = FolderScope(serverId, fullName, job?.isMultiBranch == true)
+        updateScopeBar()
+        scheduleSearch(keepSelection = false)
+    }
+
+    private fun clearScope(search: Boolean = true) {
+        scope = null
+        updateScopeBar()
+        if (search) scheduleSearch(keepSelection = false)
+    }
+
+    /** "Jenkins › team › app  ✕": every part but the last narrows to that folder, the first and ✕ show all jobs. */
+    private fun updateScopeBar() {
+        scopeBar.removeAll()
+        val current = scope
+        scopeBar.isVisible = current != null
+        if (current != null) {
+            val crumbs = JPanel(com.intellij.util.ui.WrapLayout(java.awt.FlowLayout.LEFT, JBUI.scale(3), 0)).apply { isOpaque = false }
+            fun separator() = JBLabel("\u203A").apply { foreground = UIUtil.getContextHelpForeground() }
+            crumbs.add(JBLabel(if (current.multiBranch) JenkSpotterIcons.MultiBranch else JenkSpotterIcons.Folder))
+            crumbs.add(com.intellij.ui.components.ActionLink(JenkSpotterSettings.getInstance().server(current.serverId)?.displayName.orEmpty()) { clearScope() })
+            val parts = current.fullName.split('/')
+            parts.forEachIndexed { i, part ->
+                crumbs.add(separator())
+                val name = de.pdenis.jenkspotter.api.JenkinsPaths.displayName(part)
+                crumbs.add(if (i == parts.lastIndex) JBLabel(name).apply { font = font.deriveFont(java.awt.Font.BOLD) }
+                else com.intellij.ui.components.ActionLink(name) { scopeTo(current.serverId, parts.take(i + 1).joinToString("/")) })
+            }
+            scopeBar.add(crumbs, BorderLayout.CENTER)
+            scopeBar.add(com.intellij.ui.InplaceButton(JenkSpotterBundle.message("jobs.scope.clear"), AllIcons.Actions.Close) { clearScope() }, BorderLayout.EAST)
+        }
+        scopeBar.revalidate()
+        scopeBar.repaint()
+    }
+
+    /** Whether [point] in the list is on the chains badge of the job row at [index]. */
+    private fun onChainsBadge(index: Int, point: java.awt.Point): Boolean {
+        val row = listModel.get(index) as? JobRow.Job ?: return false
+        val bounds = list.getCellBounds(index, index) ?: return false
+        val component = renderer.getListCellRendererComponent(list, row, index, list.isSelectedIndex(index), false)
+        return renderer.jobs.isOnChainsBadge(component, bounds.size, java.awt.Point(point.x - bounds.x, point.y - bounds.y))
+    }
+
+    /** Every path of follow-up jobs through [hit], see [ChainsPopup]. */
+    private fun showChains(hit: JobHit, where: RelativePoint) =
+        ChainsPopup.show(hit.serverId, hit.job, where) { jumpTo(hit.serverId, it) }
 
     /** Selects [job] in the list; the search is kept if the job is listed, otherwise cleared. */
     private fun jumpTo(serverId: String, job: JobRef) {
@@ -600,82 +608,41 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
         reveal(serverId, job.url, if (listed) search.text else "")
     }
 
-    /** Alt+Up: the job that triggers the selected one (along the longest chain). */
+    /** Alt+Up: the job that triggers the selected one; with several, a list to choose from. */
     private fun jumpPrevious() {
         val hit = selected() ?: return
-        val previous = JobIndexService.getInstance().position(hit.serverId, hit.job)?.path?.lastOrNull() ?: return
-        jumpTo(hit.serverId, previous)
+        val index = JobIndexService.getInstance()
+        // Longest chain first, as in the step shown.
+        val longest = index.position(hit.serverId, hit.job)?.path?.lastOrNull() ?: return
+        val previous = (listOf(longest) + index.state(hit.serverId).upstream[hit.job.fullName].orEmpty()).distinctBy { it.url }
+        chooseAndJump(hit, previous)
     }
 
     /** Alt+Down: the job triggered by the selected one; with several, a list to choose from. */
     private fun jumpNext() {
         val hit = selected() ?: return
         val index = JobIndexService.getInstance()
-        val next = hit.job.downstream.mapNotNull { index.jobByFullName(hit.serverId, it) }
-        when (next.size) {
+        chooseAndJump(hit, hit.job.downstream.mapNotNull { index.jobByFullName(hit.serverId, it) })
+    }
+
+    private fun chooseAndJump(hit: JobHit, jobs: List<JobRef>) {
+        when (jobs.size) {
             0 -> return
-            1 -> jumpTo(hit.serverId, next.single())
+            1 -> jumpTo(hit.serverId, jobs.single())
             else -> {
                 val bounds = list.getCellBounds(list.selectedIndex, list.selectedIndex) ?: return
-                JBPopupFactory.getInstance().createPopupChooserBuilder(next)
-                    .setRenderer(com.intellij.ui.SimpleListCellRenderer.create("") { de.pdenis.jenkspotter.api.JenkinsPaths.displayName(it.fullName) })
+                JBPopupFactory.getInstance().createPopupChooserBuilder(jobs)
+                    // Not SimpleListCellRenderer.create(...): scheduled for removal since 2026.2.
+                    .setRenderer(object : com.intellij.ui.SimpleListCellRenderer<JobRef>() {
+                        override fun customize(list: javax.swing.JList<out JobRef>, value: JobRef?, index: Int, selected: Boolean, hasFocus: Boolean) {
+                            text = value?.let { de.pdenis.jenkspotter.api.JenkinsPaths.displayName(it.fullName) }.orEmpty()
+                        }
+                    })
                     .setItemChosenCallback { jumpTo(hit.serverId, it) }
                     .createPopup()
                     .show(RelativePoint(list, java.awt.Point(bounds.x + JBUI.scale(24), bounds.y + bounds.height)))
             }
         }
-    }
-
-    /**
-     * Context menu "Follow-up Chain": previous / next job and the whole chain from the job that
-     * starts it, the selected job marked; each entry selects that job.
-     */
-    private fun chainGroup(): AnAction = object : com.intellij.openapi.actionSystem.ActionGroup({ JenkSpotterBundle.message("chain.menu") }, true) {
-        override fun getChildren(e: AnActionEvent?): Array<AnAction> {
-            val hit = selected() ?: return AnAction.EMPTY_ARRAY
-            val index = JobIndexService.getInstance()
-            val root = index.position(hit.serverId, hit.job)?.path?.firstOrNull() ?: hit.job
-            val result = mutableListOf<AnAction>(
-                action("chain.previous", AllIcons.Actions.PreviousOccurence, { index.position(hit.serverId, hit.job) != null }) { jumpPrevious() }
-                    .also { it.shortcutSet = com.intellij.openapi.actionSystem.CustomShortcutSet(javax.swing.KeyStroke.getKeyStroke(KeyEvent.VK_UP, java.awt.event.InputEvent.ALT_DOWN_MASK)) },
-                action("chain.next", AllIcons.Actions.NextOccurence, { hit.job.downstream.isNotEmpty() }) { jumpNext() }
-                    .also { it.shortcutSet = com.intellij.openapi.actionSystem.CustomShortcutSet(javax.swing.KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, java.awt.event.InputEvent.ALT_DOWN_MASK)) },
-                com.intellij.openapi.actionSystem.Separator.create(),
-            )
-            fun entry(fullName: String, job: JobRef?, depth: Int) {
-                val name = "\u2003".repeat(depth) + (if (depth > 0) "\u21B3 " else "") + de.pdenis.jenkspotter.api.JenkinsPaths.displayName(fullName) +
-                    (if (job?.disabled == true) "  " + JenkSpotterBundle.message("jobs.disabled") else "")
-                val current = job?.url == hit.job.url
-                result += object : DumbAwareAction(name, null, if (current) AllIcons.Actions.Checked else null) {
-                    override fun actionPerformed(e: AnActionEvent) {
-                        if (job != null && !current) jumpTo(hit.serverId, job)
-                    }
-                    override fun update(e: AnActionEvent) {
-                        e.presentation.isEnabled = job != null
-                    }
-                    override fun getActionUpdateThread() = ActionUpdateThread.EDT
-                }
-            }
-            fun walk(nodes: List<de.pdenis.jenkspotter.core.ChainNode>, depth: Int) {
-                for (node in nodes) {
-                    entry(node.fullName, index.jobByFullName(hit.serverId, node.fullName), depth)
-                    walk(node.children, depth + 1)
-                }
-            }
-            val chain = index.chain(hit.serverId, root)
-            if (chain.isEmpty()) return result.toTypedArray()
-            entry(root.fullName, root, 0)
-            walk(chain, 1)
-            return result.toTypedArray()
-        }
-
-        override fun update(e: AnActionEvent) {
-            val hit = selected()
-            e.presentation.isEnabledAndVisible = hit != null &&
-                (hit.job.downstream.isNotEmpty() || JobIndexService.getInstance().position(hit.serverId, hit.job) != null)
-        }
-
-        override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
     private fun selectedServerId(): String? = when (val row = list.selectedValue) {
@@ -689,7 +656,6 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     private fun collapsed(row: JobRow?): Boolean? = when (row) {
         is JobRow.Server -> row.collapsed
         is JobRow.Folder -> row.collapsed
-        is JobRow.Job -> row.expanded?.not()
         else -> null
     }
 
@@ -697,13 +663,7 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
         val settings = JenkSpotterSettings.getInstance()
         when (row) {
             is JobRow.Server -> settings.setServerCollapsed(row.serverId, collapsed)
-            is JobRow.Folder -> settings.setFolderCollapsed(row.serverId, row.path, collapsed)
-            is JobRow.Job -> {
-                if (row.expanded == null) return false
-                val key = "${row.hit.serverId} ${row.hit.job.url}"
-                if (collapsed) expandedChains.remove(key) else expandedChains.add(key)
-                scheduleSearch(keepSelection = true)
-            }
+            is JobRow.Folder -> settings.setFolderCollapsed(row.serverId, row.key, collapsed)
             else -> return false
         }
         return true
@@ -713,14 +673,17 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     private fun activate() {
         when (val row = list.selectedValue) {
             is JobRow.Job -> trigger(row.hit)
+            // Like a double-click; Left and Right open and close the node.
+            is JobRow.Folder -> scopeTo(row.serverId, row.fullName)
             null -> Unit
             else -> collapsed(row)?.let { setCollapsed(row, !it) }
         }
     }
 
     private fun trigger(hit: JobHit) {
+        if (hit.job.isFolder) return scopeTo(hit.serverId, hit.job.fullName)
         if (!hit.job.canBuild) return
-        JenkSpotterSettings.getInstance().markRecent(hit.serverId, hit.job.url)
+        // Counted as recently built once the build is really started, see BuildActions.trigger.
         BuildActions.trigger(project, hit.serverId, hit.job.url, hit.job.fullName, null)
     }
 
@@ -741,51 +704,15 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
         add(jobActions())
         add(action("action.pinFromUrl", AllIcons.General.Add, { true }) { PinFromUrl.ask(project) })
         addSeparator()
-        add(action("action.refreshIndex", AllIcons.Actions.Refresh, { filter.serverIds().isNotEmpty() }) { refreshIndexes(force = true) })
+        add(action("action.refreshIndex", AllIcons.Actions.ForceRefresh, { filter.serverIds().isNotEmpty() }) { refreshIndexes(force = true) })
         add(sortMenu())
         add(ViewOptions.menu("jobs.show", listOf(
             ViewOptions.toggle("jobs.show.path", { showJobPath }) { showJobPath = it },
             ViewOptions.toggle("jobs.show.folders", { showFolderEntries }) { showFolderEntries = it },
-            ViewOptions.toggle("jobs.show.downstream", { showDownstream }) { showDownstream = it },
-            ViewOptions.toggle("jobs.show.chainStep", { showChainStep }) { showChainStep = it },
-            jobIconMenu(),
-            chainDisplayMenu(),
-            followUpIconMenu(),
-            chainStepIconMenu(),
-            visibilityToggleMenu(),
+            ViewOptions.toggle("jobs.show.triggers", { showTriggers }) { showTriggers = it },
+            ViewOptions.toggle("jobs.show.workflowColors", { showWorkflowColors }) { showWorkflowColors = it },
+            ViewOptions.toggle("jobs.show.hoverChain", { highlightChainOnHover }) { highlightChainOnHover = it },
         )))
-    }
-
-    /** Icon in front of the jobs; the choice is shown live while the menu stays open. */
-    private fun jobIconMenu(): AnAction = DefaultActionGroup({ JenkSpotterBundle.message("jobs.icon") }, true).apply {
-        JobIcon.entries.forEach { style ->
-            if (style.ordinal > 0 && JobIcon.entries[style.ordinal - 1].group != style.group) addSeparator()
-            add(radio(style.key, { jobIcon == style }, JenkSpotterIcons.job(style, parameterized = false)) { jobIcon = style })
-        }
-    }
-
-    private fun visibilityToggleMenu(): AnAction = DefaultActionGroup({ JenkSpotterBundle.message("jenkins.toggle") }, true).apply {
-        VisibilityToggle.entries.forEach { style ->
-            val icon = ServerStatusUi.toggleIcon(style, hidden = false)
-            add(radio(style.key, { visibilityToggle == style }, icon) { visibilityToggle = style })
-        }
-    }
-
-    private fun chainDisplayMenu(): AnAction = DefaultActionGroup({ JenkSpotterBundle.message("jobs.chainDisplay") }, true).apply {
-        ChainDisplay.entries.forEach { mode -> add(radio(mode.key, { chainDisplay == mode }) { chainDisplay = mode }) }
-    }
-
-    private fun chainStepIconMenu(): AnAction = DefaultActionGroup({ JenkSpotterBundle.message("jobs.chainStepIcon") }, true).apply {
-        ChainStepIcon.entries.forEach { style ->
-            val icon = JenkSpotterIcons.chainStep(style, JenkSpotterSettings.getInstance().current.followUpIcon)
-            add(radio(style.key, { chainStepIcon == style }, icon) { chainStepIcon = style })
-        }
-    }
-
-    private fun followUpIconMenu(): AnAction = DefaultActionGroup({ JenkSpotterBundle.message("jobs.followUpIcon") }, true).apply {
-        FollowUpIcon.entries.forEach { style ->
-            add(radio(style.key, { followUpIcon == style }, JenkSpotterIcons.followUp(style)) { followUpIcon = style })
-        }
     }
 
     /** Order, favourites on top, layout (tree / list with Jenkins name), expand/collapse. */
@@ -854,7 +781,7 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
 
     private inner class Renderer : ListCellRenderer<JobRow> {
         var serverNodes = false
-        private val jobs = JobHitRenderer(::serverLabel)
+        val jobs = JobHitRenderer(::serverLabel)
         private val servers = ServerRenderer()
         private val folders = FolderRenderer()
 
@@ -873,15 +800,13 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
             @Suppress("UNCHECKED_CAST")
             when (value) {
                 is JobRow.Server -> servers.getListCellRendererComponent(list as JList<out JobRow.Server>, value, index, selected, focus)
+                    .also { it.background = Stripes.background(index % 2 == 1, selected, focus) }
                 is JobRow.Folder -> folders.getListCellRendererComponent(list as JList<out JobRow.Folder>, value, index, selected, focus)
+                    .also { it.background = Stripes.background(index % 2 == 1, selected, focus) }
                 is JobRow.Job -> {
                     jobs.indent = value.depth * GROUP_INDENT
                     jobs.folderShown = value.folder
-                    jobs.chainDepth = value.chainDepth
-                    jobs.expanded = value.expanded
-                    jobs.lane = value.lane
-                    jobs.laneDashedIn = value.laneDashedIn
-                    jobs.laneDashedOut = value.laneDashedOut
+                    jobs.connector = value.branch
                     jobs.relation = related["${value.hit.serverId} ${value.hit.job.url}"]
                     jobs.getListCellRendererComponent(list as JList<out JobHit>, value.hit, index, selected, focus)
                 }
@@ -892,7 +817,7 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
     private class FolderRenderer : ColoredListCellRenderer<JobRow.Folder>() {
         override fun customizeCellRenderer(list: JList<out JobRow.Folder>, value: JobRow.Folder, index: Int, selected: Boolean, hasFocus: Boolean) {
             ipad = JBUI.insets(1, 2 + value.depth * GROUP_INDENT, 1, 2)
-            icon = RowIcon(if (value.collapsed) AllIcons.General.ArrowRight else AllIcons.General.ArrowDown, JenkSpotterIcons.Folder)
+            icon = RowIcon(if (value.collapsed) AllIcons.General.ArrowRight else AllIcons.General.ArrowDown, if (value.multiBranch) JenkSpotterIcons.MultiBranch else JenkSpotterIcons.Folder)
             append(value.path)
             append("   " + JenkSpotterBundle.message("jobs.group.count", value.count), SimpleTextAttributes.GRAYED_ATTRIBUTES)
         }
@@ -907,7 +832,7 @@ class JobsPanel(private val project: Project, private val filter: SharedFilter) 
             append(server.displayName, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
             append("   " + JenkSpotterBundle.message("jobs.group.count", value.count), SimpleTextAttributes.GRAYED_ATTRIBUTES)
             if (state != ConnectionState.CONNECTED) {
-                append("   " + ServerStatusUi.label(state), if (state == ConnectionState.ERROR || state == ConnectionState.OFFLINE) SimpleTextAttributes.ERROR_ATTRIBUTES else SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)
+                append("   " + ServerStatusUi.label(state), if (state == ConnectionState.ERROR) SimpleTextAttributes.ERROR_ATTRIBUTES else SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)
             }
             val index = JobIndexService.getInstance().state(value.serverId)
             if (index.loading) append("   " + JenkSpotterBundle.message("jobs.group.loading"), SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES)

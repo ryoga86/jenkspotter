@@ -60,11 +60,9 @@ class HiddenJobsTest {
     }
 
     @Test
-    fun `chain is described transitively`() {
+    fun `chain size counts the whole subtree`() {
         val node = ChainNode("team/middle", "u", listOf(ChainNode("team/last", "u2", emptyList()), ChainNode("team/other", null, emptyList())))
-        assertEquals("middle \u2192 (last, other)", node.describe())
         assertEquals(3, node.size)
-        assertEquals("a \u2192 b", ChainNode("a", null, listOf(ChainNode("x/b", null, emptyList()))).describe())
     }
 
     @Test

@@ -10,7 +10,6 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.SimpleToolWindowPanel
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.ColoredTableCellRenderer
@@ -37,8 +36,7 @@ import de.pdenis.jenkspotter.core.TrackedBuild
 import de.pdenis.jenkspotter.settings.JenkSpotterConfigurable
 import de.pdenis.jenkspotter.settings.BuildColumn
 import de.pdenis.jenkspotter.settings.JenkSpotterSettings
-import de.pdenis.jenkspotter.settings.SettingsListener
-import de.pdenis.jenkspotter.settings.BuildStatusFilter
+import de.pdenis.jenkspotter.settings.BuildChip
 import java.awt.BorderLayout
 import java.awt.FlowLayout
 import java.awt.event.MouseEvent
@@ -67,12 +65,6 @@ sealed class BuildRow {
     }
 }
 
-private enum class Scope(val key: String) {
-    ALL("filter.scope.all"), MINE("filter.scope.mine"), BRANCH("filter.scope.branch"), WAITING("filter.scope.waiting"),
-    PINNED("filter.scope.pinned"), WATCHED("filter.scope.watched"), VIEWS("filter.scope.views"), RUNNING("filter.scope.running");
-    override fun toString() = JenkSpotterBundle.message(key)
-}
-
 class BuildsPanel(private val project: Project, private val filter: SharedFilter) : SimpleToolWindowPanel(true, true), Disposable {
     @Volatile
     private var disposed = false
@@ -84,8 +76,33 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         override fun getRenderer(item: BuildRow?) = jobRenderer
     }
     private var shownColumns: List<BuildColumn>? = null
-    private val table = TableView(model)
-    private val scopeCombo = ComboBox(Scope.entries.toTypedArray())
+    /** Per table row: tinted background. A build and its follow-ups share one, so a chain reads as one block. */
+    private var stripes = BooleanArray(0)
+    private val table = object : TableView<BuildRow>(model) {
+        override fun prepareRenderer(renderer: javax.swing.table.TableCellRenderer, row: Int, column: Int): java.awt.Component {
+            val component = super.prepareRenderer(renderer, row, column)
+            if (!isRowSelected(row)) component.background = Stripes.background(stripes.getOrElse(row) { false }, false, false)
+            return component
+        }
+
+        // Built when asked for, not for every row with every repaint.
+        override fun getToolTipText(event: MouseEvent): String? {
+            val row = rowAtPoint(event.point)
+            val column = columnAtPoint(event.point)
+            if (row >= 0 && column >= 0 && convertColumnIndexToModel(column) == 0) {
+                (this@BuildsPanel.model.items.getOrNull(convertRowIndexToModel(row)) as? BuildRow.Build)?.let { return buildTooltip(it.tracked) }
+            }
+            return super.getToolTipText(event)
+        }
+    }
+    /** Build status and scope chips, like the filter chips of the Jenkins view. */
+    private val chipBar = JPanel(com.intellij.util.ui.WrapLayout(FlowLayout.LEFT, JBUI.scale(4), JBUI.scale(2))).apply { isOpaque = false }
+    private var shownChips: Map<BuildChip, ChipState>? = null
+
+    /** Current page (0-based); one page holds [pageSize] builds, each with its follow-ups. */
+    private var page = 0
+    private val pageLabel = JBLabel().apply { foreground = com.intellij.util.ui.UIUtil.getContextHelpForeground() }
+    private var pageCount = 1
     private val search = com.intellij.ui.SearchTextField(false).apply {
         textEditor.emptyText.text = JenkSpotterBundle.message("builds.searchHint")
         textEditor.columns = 12
@@ -93,10 +110,27 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
 
     /** Finished builds that ended before this time are hidden by "Clear Finished" (pins/views excepted). */
     private var clearedBefore = 0L
+
+    /** True while [render] replaces the rows and restores the selection. */
+    private var rendering = false
     private val details = BuildDetailsPanel(project)
     private val tableScroll = JBScrollPane(table)
+    private val pager = JPanel(BorderLayout()).apply {
+        border = JBUI.Borders.compound(JBUI.Borders.customLineTop(JBUI.CurrentTheme.ToolWindow.borderColor()), JBUI.Borders.empty(0, 4))
+        add(pageLabel, BorderLayout.CENTER)
+        add(ActionManager.getInstance().createActionToolbar("JenkSpotter.BuildsPager", DefaultActionGroup().apply {
+            add(action("builds.page.previous", AllIcons.Actions.Back, enabled = { page > 0 }) { goToPage(page - 1) })
+            add(action("builds.page.next", AllIcons.Actions.Forward, enabled = { page < pageCount - 1 }) { goToPage(page + 1) })
+            add(pageSizeMenu())
+        }, true).also { it.targetComponent = table }.component, BorderLayout.EAST)
+    }
+    private val tablePanel = JPanel(BorderLayout()).apply {
+        add(tableScroll, BorderLayout.CENTER)
+        add(pager, BorderLayout.SOUTH)
+    }
     private val detailsSplitter = com.intellij.ui.OnePixelSplitter(true, "JenkSpotter.BuildDetails", 0.62f)
     private val content = JPanel(BorderLayout())
+    private val hoverAlarm = com.intellij.util.Alarm(com.intellij.util.Alarm.ThreadToUse.SWING_THREAD, this)
     private val ticker = Timer(1000) { if (model.items.any { it is BuildRow.Build && it.tracked.build.building }) table.repaint() }
 
     init {
@@ -110,18 +144,25 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
                 saveColumnOrder()
                 saveColumnWidths()
             }
-        })
-        table.emptyText.text = JenkSpotterBundle.message("builds.empty")
-        table.emptyText.appendSecondaryText(JenkSpotterBundle.message("action.configure"), SimpleTextAttributes.LINK_PLAIN_ATTRIBUTES) {
-            ShowSettingsUtil.getInstance().showSettingsDialog(project, JenkSpotterConfigurable::class.java)
-        }
 
-        // One compact row: scope and search on the left, actions on the right.
-        val filters = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0)).apply { add(scopeCombo); add(search) }
+            // Not fired after dragging a column or its edge, so moving and resizing do not sort.
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.button != MouseEvent.BUTTON1) return
+                val index = table.columnModel.getColumnIndexAtX(e.x).takeIf { it >= 0 } ?: return
+                toggleSort(sortKey(model.columnInfos.getOrNull(table.columnModel.getColumn(index).modelIndex) ?: return))
+            }
+        })
+
+        // Search and actions in one row, the filter chips below.
         val north = JPanel(BorderLayout()).apply {
             border = JBUI.Borders.empty(1, 2)
-            add(filters, BorderLayout.CENTER)
-            add(createToolbar(), BorderLayout.EAST)
+            add(JPanel(BorderLayout(JBUI.scale(4), 0)).apply {
+                isOpaque = false
+                border = JBUI.Borders.emptyLeft(2)
+                add(search, BorderLayout.CENTER)
+                add(createToolbar(), BorderLayout.EAST)
+            }, BorderLayout.NORTH)
+            add(chipBar, BorderLayout.CENTER)
         }
         model.isSortable = false
         toolbar = north
@@ -132,12 +173,29 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             layoutDetails()
         }
         layoutDetails()
-        table.selectionModel.addListSelectionListener { if (!it.valueIsAdjusting) details.show(selectedBuild()) }
+        table.selectionModel.addListSelectionListener {
+            // While render() swaps the rows the selection is briefly empty; passing that on would make
+            // the build info forget the build and load everything again. render() hands it over once.
+            if (it.valueIsAdjusting || rendering) return@addListSelectionListener
+            val build = selectedBuild()
+            // Picking a build opens the build info; keeping the selection across a refresh does not.
+            if (build != null && details.collapsed) {
+                details.setCollapsed(false)
+                details.onCollapsedChanged(false)
+            }
+            details.show(build)
+        }
 
-        filter.onChange { render(BuildMonitorService.getInstance().snapshot) }
-        scopeCombo.addActionListener { render(BuildMonitorService.getInstance().snapshot) }
+        filter.onChange {
+            rebuildChips()
+            render(BuildMonitorService.getInstance().snapshot)
+        }
+        rebuildChips()
         search.addDocumentListener(object : com.intellij.ui.DocumentAdapter() {
-            override fun textChanged(e: javax.swing.event.DocumentEvent) = render(BuildMonitorService.getInstance().snapshot)
+            override fun textChanged(e: javax.swing.event.DocumentEvent) {
+                page = 0
+                render(BuildMonitorService.getInstance().snapshot)
+            }
         })
         // Enter opens the log of the selected build, like a double-click.
         table.inputMap.put(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_ENTER, 0), "jenkspotter.openLog")
@@ -147,6 +205,21 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             }
         })
 
+        // Resting on a failed build loads why it failed, for its tooltip (see [buildTooltip]).
+        table.addMouseMotionListener(object : java.awt.event.MouseAdapter() {
+            override fun mouseMoved(e: MouseEvent) {
+                hoverAlarm.cancelAllRequests()
+                val row = table.rowAtPoint(e.point).takeIf { it >= 0 } ?: return
+                val build = (model.items.getOrNull(table.convertRowIndexToModel(row)) as? BuildRow.Build)?.tracked ?: return
+                // Only a mouse that stays: sweeping over the table must not load every red build on the way.
+                val at = e.point
+                hoverAlarm.addRequest({
+                    de.pdenis.jenkspotter.core.FailureHints.getInstance().hint(build) {
+                        ApplicationManager.getApplication().invokeLater({ refreshTooltip(at) }, { disposed || project.isDisposed })
+                    }
+                }, HOVER_DELAY_MILLIS)
+            }
+        })
         object : DoubleClickListener() {
             override fun onDoubleClick(event: MouseEvent): Boolean {
                 selectedBuild()?.let { BuildActions.openLog(project, it) } ?: return false
@@ -199,10 +272,8 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         val connection = ApplicationManager.getApplication().messageBus.connect(this)
         connection.subscribe(BuildMonitorListener.TOPIC, object : BuildMonitorListener {
             override fun snapshotChanged(snapshot: MonitorSnapshot) {
-                ApplicationManager.getApplication().invokeLater({
-                    render(snapshot)
-                    details.refresh(selectedBuild())
-                }, { disposed || project.isDisposed })
+                // render() hands the selected build on to the build info.
+                ApplicationManager.getApplication().invokeLater({ render(snapshot) }, { disposed || project.isDisposed })
             }
         })
         ticker.start()
@@ -213,36 +284,50 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         applyColumns()
         val selectedKey = table.selectedObject?.key
         val hidden = filter.hidden()
-        val scope = scopeCombo.selectedItem as? Scope ?: Scope.ALL
-        val hiddenStatuses = statusFilterHidden()
+        val chips = chipStates()
 
         val builds = snapshot.builds.asSequence()
             .filter { filter.includes(it.serverId) && !hidden.isHidden(it.build.jobFullName) }
-            .filter {
-                when (scope) {
-                    Scope.ALL -> true
-                    Scope.MINE -> it.mine
-                    Scope.BRANCH -> isCurrentBranch(it)
-                    Scope.WAITING -> it.key in snapshot.waitingInput
-                    Scope.PINNED -> BuildSource.PINNED in it.sources
-                    Scope.WATCHED -> BuildSource.WATCHED in it.sources
-                    Scope.VIEWS -> BuildSource.VIEW in it.sources
-                    Scope.RUNNING -> it.build.building
-                }
-            }
-            .filter { statusOf(it.build) !in hiddenStatuses }
+            .filter { tracked -> BuildTableLogic.passes(chips) { chip -> matches(chip, tracked, snapshot) } }
             .filter { it.build.building || it.sources.any { s -> s == BuildSource.PINNED || s == BuildSource.WATCHED || s == BuildSource.VIEW } ||
                 it.build.timestamp + it.build.durationMillis >= clearedBefore }
             .filter { matchesSearch(it.build.jobFullName, it.build.number.toString(), it.build.parameters.joinToString(" ") { p -> "${p.name}=${p.value}" }, it.build.description.orEmpty()) }
             .toList()
         val queued = snapshot.queued.asSequence()
-            .filter { filter.includes(it.serverId) && !hidden.isHidden(it.jobFullName) && BuildStatusFilter.QUEUED !in hiddenStatuses && scope in setOf(Scope.ALL, Scope.MINE) }
+            // Builds started from here: queued, and mine.
+            .filter { filter.includes(it.serverId) && !hidden.isHidden(it.jobFullName) && BuildTableLogic.passes(chips) { c -> c == BuildChip.QUEUED || c == BuildChip.MINE } }
             .filter { matchesSearch(it.jobFullName) }
             .map { BuildRow.Queued(it) }
-        model.items = queued.toList() + withChildren(builds)
-        model.items.indexOfFirst { it.key == selectedKey }.takeIf { it >= 0 }?.let {
-            table.selectionModel.setSelectionInterval(it, it)
+        // One page holds whole groups: a build with its follow-ups is never split.
+        val groups = BuildTableLogic.groups(queued.toList() + withChildren(builds))
+        // Sorting moves whole groups by their first row, follow-ups stay below the build that started them.
+        currentSort()?.let { (key, ascending) ->
+            val comparator = sortComparator(key)
+            groups.sortWith { a, b -> comparator.compare(a.first(), b.first()).let { if (ascending) it else -it } }
         }
+        updateSortMarks()
+        val size = pageSize()
+        pageCount = BuildTableLogic.pageCount(groups.size, size)
+        // New builds push older ones back a page: the table follows the selected build instead of losing it.
+        selectedKey?.let { BuildTableLogic.pageOf(groups, it, size) }?.let { page = it }
+        page = page.coerceIn(0, pageCount - 1)
+        val shown = BuildTableLogic.page(groups, page, size)
+        stripes = shown.flatMapIndexed { i, group -> List(group.size) { i % 2 == 1 } }.toBooleanArray()
+        val builtCount = groups.sumOf { g -> g.count { it is BuildRow.Build } }
+        pageLabel.text = JenkSpotterBundle.message("builds.page", page + 1, pageCount, builtCount)
+        pager.isVisible = pageCount > 1
+        updateEmptyText(shown.isEmpty() && snapshot.builds.any { filter.includes(it.serverId) })
+        rendering = true
+        try {
+            model.items = shown.flatten()
+            model.items.indexOfFirst { it.key == selectedKey }.takeIf { it >= 0 }?.let {
+                table.selectionModel.setSelectionInterval(it, it)
+            }
+        } finally {
+            rendering = false
+        }
+        // Same build still selected: only its data is updated, nothing is loaded again.
+        details.show(selectedBuild())
     }
 
     /** Open build info: splitter below the table; closed: just its title row under the table. */
@@ -251,10 +336,10 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         if (details.collapsed) {
             detailsSplitter.firstComponent = null
             detailsSplitter.secondComponent = null
-            content.add(tableScroll, BorderLayout.CENTER)
+            content.add(tablePanel, BorderLayout.CENTER)
             content.add(details, BorderLayout.SOUTH)
         } else {
-            detailsSplitter.firstComponent = tableScroll
+            detailsSplitter.firstComponent = tablePanel
             detailsSplitter.secondComponent = details
             content.add(detailsSplitter, BorderLayout.CENTER)
         }
@@ -300,7 +385,7 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
             val own = children[build.key].orEmpty().sortedBy { it.build.timestamp }
             own.forEach { add(it, depth + 1) }
             // While a build runs, show the follow-ups its configuration will trigger but that did not start yet.
-            if (build.build.building && BuildStatusFilter.QUEUED !in statusFilterHidden()) {
+            if (build.build.building && BuildTableLogic.statusPasses(chipStates(), BuildChip.QUEUED)) {
                 val job = index.jobByUrl(build.serverId, build.build.jobUrl) ?: return
                 val started = own.map { it.build.jobFullName }.toSet()
                 addExpected(build.serverId, build.key, index.chain(build.serverId, job).filter { it.fullName !in started }, depth + 1)
@@ -315,7 +400,7 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
     private fun selectedInput() = selectedBuild()?.let { BuildMonitorService.getInstance().snapshot.waitingInput[it.key] }
 
     private fun createToolbar() = ActionManager.getInstance()
-        .createActionToolbar("JenkSpotter.Builds", actionGroup(), true)
+        .createActionToolbar("JenkSpotter.Builds", DefaultActionGroup(actionGroup(), com.intellij.openapi.actionSystem.Separator.getInstance(), tableActions()), true)
         .also { it.targetComponent = table }
         .component
 
@@ -337,67 +422,154 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
                 null -> Unit
             }
         })
-        addSeparator()
-        add(statusFilterMenu())
-        add(action("action.clearFinished", AllIcons.Actions.GC, enabled = { model.items.any { it is BuildRow.Build && !it.tracked.build.building } }) {
-            clearedBefore = System.currentTimeMillis()
-            render(BuildMonitorService.getInstance().snapshot)
+    }
+
+    /** Actions on the table as a whole; only in the toolbar, not in the menu of a row. */
+    private fun tableActions() = DefaultActionGroup().apply {
+        // Stays pressed while finished builds are hidden, so it is visible why they are missing.
+        add(object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message("action.clearFinished"), null, AllIcons.Actions.GC) {
+            override fun isSelected(e: AnActionEvent) = clearedBefore > 0
+            override fun setSelected(e: AnActionEvent, state: Boolean) {
+                clearedBefore = if (state) System.currentTimeMillis() else 0
+                render(BuildMonitorService.getInstance().snapshot)
+            }
+            override fun update(e: AnActionEvent) {
+                super.update(e)
+                e.presentation.description = JenkSpotterBundle.message("action.clearFinished.description")
+            }
+            override fun getActionUpdateThread() = ActionUpdateThread.EDT
         })
         // Refresh and settings are in the tool window title.
         add(columnsMenu())
     }
 
-    private fun statusFilterHidden(): Set<BuildStatusFilter> =
-        JenkSpotterSettings.getInstance().current.hiddenStatuses.mapNotNull { n -> BuildStatusFilter.entries.firstOrNull { it.name == n } }.toSet()
+    /** What the empty table says: nothing known yet, or everything filtered away - then with a way out. */
+    private fun updateEmptyText(filtered: Boolean) {
+        val text = table.emptyText
+        text.clear()
+        if (!filtered) {
+            text.appendText(JenkSpotterBundle.message("builds.empty"))
+            text.appendSecondaryText(JenkSpotterBundle.message("action.configure"), SimpleTextAttributes.LINK_PLAIN_ATTRIBUTES) {
+                ShowSettingsUtil.getInstance().showSettingsDialog(project, JenkSpotterConfigurable::class.java)
+            }
+            return
+        }
+        val reasons = listOfNotNull(
+            chipStates().size.takeIf { it > 0 }?.let { JenkSpotterBundle.message("builds.empty.chips", it) },
+            search.text.trim().takeIf { it.isNotEmpty() }?.let { JenkSpotterBundle.message("builds.empty.search", it) },
+            JenkSpotterBundle.message("builds.empty.cleared").takeIf { clearedBefore > 0 },
+            JenkSpotterBundle.message("builds.empty.jobFilters").takeIf { JenkSpotterSettings.getInstance().current.filters.any { it.enabled } },
+        )
+        text.appendText(JenkSpotterBundle.message("builds.empty.filtered", reasons.joinToString(", ")))
+        if (hasOwnFilters()) text.appendSecondaryText(JenkSpotterBundle.message("builds.filters.reset"), SimpleTextAttributes.LINK_PLAIN_ATTRIBUTES) { resetFilters() }
+    }
 
-    private fun setHiddenStatuses(hidden: Set<BuildStatusFilter>) =
-        JenkSpotterSettings.getInstance().updateView { hiddenStatuses = hidden.map { it.name }.toMutableList() }
+    /** Chips, search text or hidden finished builds: what [resetFilters] undoes. */
+    private fun hasOwnFilters() = chipStates().isNotEmpty() || search.text.isNotBlank() || clearedBefore > 0
 
-    /** Filter icon with one check box per build status; the icon gets a dot while something is hidden. */
-    private fun statusFilterMenu() = object : DefaultActionGroup({ JenkSpotterBundle.message("builds.statusFilter") }, true) {
-        init {
-            templatePresentation.icon = AllIcons.General.Filter
-            add(object : DumbAwareAction({ JenkSpotterBundle.message("builds.statusFilter.all") }) {
-                override fun actionPerformed(e: AnActionEvent) = setHiddenStatuses(emptySet())
-                override fun update(e: AnActionEvent) {
-                    e.presentation.isEnabled = statusFilterHidden().isNotEmpty()
+    private fun resetFilters() {
+        clearedBefore = 0
+        page = 0
+        if (search.text.isNotEmpty()) search.text = ""
+        if (chipStates().isNotEmpty()) JenkSpotterSettings.getInstance().updateView { buildChips = mutableListOf() }
+        else render(BuildMonitorService.getInstance().snapshot)
+    }
+
+    private fun chipStates(): Map<BuildChip, ChipState> =
+        JenkSpotterSettings.getInstance().current.buildChips.mapNotNull { entry ->
+            val (name, state) = entry.split('=').takeIf { it.size == 2 } ?: return@mapNotNull null
+            val chip = BuildChip.entries.firstOrNull { it.name == name } ?: return@mapNotNull null
+            ChipState.entries.firstOrNull { it.name == state }?.let { chip to it }
+        }.toMap()
+
+    private fun setChip(chip: BuildChip, state: ChipState) {
+        page = 0
+        val next = (chipStates() + (chip to state)).filterValues { it != ChipState.OFF }
+        // Settings listeners rebuild the chips and render the table.
+        JenkSpotterSettings.getInstance().updateView { buildChips = next.map { "${it.key.name}=${it.value.name}" }.toMutableList() }
+    }
+
+    /**
+     * The status chips are always there. The scope chips (mine, pinned, ...) are in the "Filter"
+     * menu and show up as a chip only while they are green or red.
+     */
+    private fun rebuildChips() {
+        val states = chipStates()
+        if (states == shownChips) return
+        shownChips = states
+        chipBar.removeAll()
+        fun chip(chip: BuildChip) = FilterChip(
+            JenkSpotterBundle.message(chip.key), states[chip] ?: ChipState.OFF,
+            CHIP_STATES, { setChip(chip, it) }, null, null,
+            "<html><b>" + JenkSpotterBundle.message(chip.tooltipKey) + "</b><br>" + JenkSpotterBundle.message("filter.chip.help") + "</html>",
+        )
+        BuildChip.entries.filter { it.status }.forEach { chipBar.add(chip(it)) }
+        chipBar.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(4)))
+        BuildChip.entries.filter { !it.status && it in states }.forEach { chipBar.add(chip(it)) }
+        chipBar.add(com.intellij.ui.components.DropDownLink(JenkSpotterBundle.message("builds.filters.more")) { link -> scopeMenu(link) }.apply {
+            toolTipText = JenkSpotterBundle.message("builds.filters.more.tooltip")
+        })
+        chipBar.revalidate()
+        chipBar.repaint()
+    }
+
+    /** "Mine > Show only / Hide / Off" for every scope chip, and a way back to no filter at all. */
+    private fun scopeMenu(owner: java.awt.Component): com.intellij.openapi.ui.popup.JBPopup {
+        val states = chipStates()
+        val group = DefaultActionGroup()
+        for (chip in BuildChip.entries.filter { !it.status }) {
+            group.add(DefaultActionGroup(JenkSpotterBundle.message(chip.key), true).apply {
+                templatePresentation.description = JenkSpotterBundle.message(chip.tooltipKey)
+                for (state in CHIP_STATES) {
+                    add(object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message(state.key)) {
+                        override fun isSelected(e: AnActionEvent) = (states[chip] ?: ChipState.OFF) == state
+                        override fun setSelected(e: AnActionEvent, selected: Boolean) = setChip(chip, state)
+                        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+                    })
+                }
+            })
+        }
+        group.addSeparator()
+        group.add(action("builds.filters.reset", AllIcons.Actions.Cancel, enabled = { hasOwnFilters() }) { resetFilters() })
+        return com.intellij.openapi.ui.popup.JBPopupFactory.getInstance().createActionGroupPopup(
+            null, group, com.intellij.ide.DataManager.getInstance().getDataContext(owner),
+            com.intellij.openapi.ui.popup.JBPopupFactory.ActionSelectionAid.SPEEDSEARCH, false,
+        )
+    }
+
+    private fun matches(chip: BuildChip, tracked: TrackedBuild, snapshot: MonitorSnapshot): Boolean = when (chip) {
+        BuildChip.MINE -> tracked.mine
+        BuildChip.BRANCH -> isCurrentBranch(tracked)
+        BuildChip.WAITING -> tracked.key in snapshot.waitingInput
+        BuildChip.PINNED -> BuildSource.PINNED in tracked.sources
+        BuildChip.WATCHED -> BuildSource.WATCHED in tracked.sources
+        BuildChip.VIEWS -> BuildSource.VIEW in tracked.sources
+        BuildChip.QUEUED -> false
+        else -> statusOf(tracked.build) == chip
+    }
+
+    private fun pageSize(): Int = JenkSpotterSettings.getInstance().current.buildsPageSize.coerceAtLeast(10)
+
+    private fun goToPage(target: Int) {
+        // The table follows its selection, so leafing on lets go of it.
+        table.clearSelection()
+        page = target.coerceIn(0, pageCount - 1)
+        render(BuildMonitorService.getInstance().snapshot)
+        table.scrollRectToVisible(java.awt.Rectangle(0, 0, 1, 1))
+    }
+
+    private fun pageSizeMenu() = DefaultActionGroup({ JenkSpotterBundle.message("builds.pageSize") }, true).apply {
+        templatePresentation.icon = AllIcons.Actions.GroupBy
+        for (size in PAGE_SIZES) {
+            add(object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message("builds.pageSize.entry", size)) {
+                override fun isSelected(e: AnActionEvent) = pageSize() == size
+                override fun setSelected(e: AnActionEvent, state: Boolean) {
+                    page = 0
+                    JenkSpotterSettings.getInstance().updateView { buildsPageSize = size }
                 }
                 override fun getActionUpdateThread() = ActionUpdateThread.EDT
             })
-            add(object : DumbAwareAction({ JenkSpotterBundle.message("builds.statusFilter.onlyFailed") }) {
-                override fun actionPerformed(e: AnActionEvent) =
-                    setHiddenStatuses(BuildStatusFilter.entries.toSet() - BuildStatusFilter.FAILURE - BuildStatusFilter.UNSTABLE)
-                override fun getActionUpdateThread() = ActionUpdateThread.EDT
-            })
-            addSeparator()
-            for (status in BuildStatusFilter.entries) {
-                add(object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message(status.key), null, statusIcon(status)) {
-                    override fun isSelected(e: AnActionEvent) = status !in statusFilterHidden()
-                    override fun setSelected(e: AnActionEvent, state: Boolean) {
-                        setHiddenStatuses(if (state) statusFilterHidden() - status else statusFilterHidden() + status)
-                    }
-                    override fun getActionUpdateThread() = ActionUpdateThread.EDT
-                })
-            }
         }
-
-        override fun update(e: AnActionEvent) {
-            val hidden = statusFilterHidden()
-            e.presentation.icon = com.intellij.ui.BadgeIconSupplier(AllIcons.General.Filter).getLiveIndicatorIcon(hidden.isNotEmpty())
-            e.presentation.text = JenkSpotterBundle.message("builds.statusFilter") +
-                if (hidden.isEmpty()) "" else " (" + BuildStatusFilter.entries.filter { it !in hidden }.joinToString { JenkSpotterBundle.message(it.key) } + ")"
-        }
-
-        override fun getActionUpdateThread() = ActionUpdateThread.EDT
-    }
-
-    private fun statusIcon(status: BuildStatusFilter): javax.swing.Icon = when (status) {
-        BuildStatusFilter.RUNNING -> AllIcons.Actions.Execute
-        BuildStatusFilter.SUCCESS -> JenkSpotterIcons.forResult(BuildResult.SUCCESS)
-        BuildStatusFilter.FAILURE -> JenkSpotterIcons.forResult(BuildResult.FAILURE)
-        BuildStatusFilter.UNSTABLE -> JenkSpotterIcons.forResult(BuildResult.UNSTABLE)
-        BuildStatusFilter.ABORTED -> JenkSpotterIcons.forResult(BuildResult.ABORTED)
-        BuildStatusFilter.QUEUED -> JenkSpotterIcons.Queued
     }
 
     /** Pin / watch the job of the selected build; the text names what a click will do. */
@@ -435,6 +607,65 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
     }
 
     /** Rebuilds the table columns if the chosen set or order changed. */
+    /** Column key for sorting: the [BuildColumn] name, or JOB for the job column. */
+    private fun sortKey(info: ColumnInfo<*, *>): String = (info as? FixedColumn)?.column?.name ?: SORT_JOB
+
+    /** (key, ascending), null = default order (newest first). */
+    private fun currentSort(): Pair<String, Boolean>? {
+        val parts = JenkSpotterSettings.getInstance().current.buildSort.split(':').takeIf { it.size == 2 } ?: return null
+        return parts[0] to (parts[1] == "asc")
+    }
+
+    /** Header click: ascending, descending, back to the default order. Times and durations start descending. */
+    private fun toggleSort(key: String) {
+        val current = currentSort()
+        val firstDescending = key == BuildColumn.STARTED.name || key == BuildColumn.DURATION.name
+        val next = when {
+            current?.first != key -> if (firstDescending) "desc" else "asc"
+            current.second == firstDescending -> if (firstDescending) "asc" else "desc"
+            else -> null
+        }
+        page = 0
+        // Settings listeners render the table again.
+        JenkSpotterSettings.getInstance().updateView { buildSort = next?.let { "$key:$it" }.orEmpty() }
+    }
+
+    /** "▲" / "▼" behind the header of the sorted column. */
+    private fun updateSortMarks() {
+        val sort = currentSort()
+        for (i in 0 until table.columnModel.columnCount) {
+            val column = table.columnModel.getColumn(i)
+            val info = model.columnInfos.getOrNull(column.modelIndex) ?: continue
+            val mark = if (sort?.first == sortKey(info)) (if (sort.second) " \u25B2" else " \u25BC") else ""
+            column.headerValue = info.name + mark
+        }
+        table.tableHeader.repaint()
+    }
+
+    private fun sortComparator(key: String): Comparator<BuildRow> {
+        fun build(row: BuildRow) = (row as? BuildRow.Build)?.tracked
+        @Suppress("UNCHECKED_CAST")
+        val info = model.columnInfos.firstOrNull { sortKey(it) == key } as ColumnInfo<BuildRow, *>?
+        val text = Comparator<BuildRow> { a, b -> String.CASE_INSENSITIVE_ORDER.compare(info?.valueOf(a)?.toString().orEmpty(), info?.valueOf(b)?.toString().orEmpty()) }
+        return when (key) {
+            SORT_JOB -> compareBy(String.CASE_INSENSITIVE_ORDER) { jobLabel(it.serverId, jobName(it)) }
+            BuildColumn.STARTED.name -> compareBy { row ->
+                when (row) {
+                    is BuildRow.Build -> row.tracked.build.timestamp
+                    is BuildRow.Queued -> row.trigger.since
+                    is BuildRow.Expected -> Long.MAX_VALUE
+                }
+            }
+            BuildColumn.DURATION.name -> {
+                // One "now" for the whole sort: a clock moving between comparisons makes the order inconsistent.
+                val now = System.currentTimeMillis()
+                compareBy { row -> build(row)?.build?.let { if (it.building) now - it.timestamp else it.durationMillis } ?: -1L }
+            }
+            BuildColumn.TESTS.name -> compareBy<BuildRow> { build(it)?.build?.tests?.failed ?: -1 }.thenBy { build(it)?.build?.tests?.total ?: -1 }
+            else -> text
+        }
+    }
+
     private fun applyColumns() {
         val wanted = BuildColumn.parse(JenkSpotterSettings.getInstance().current.buildColumns)
         if (wanted == shownColumns) return
@@ -562,19 +793,34 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         JenkSpotterSettings.getInstance().updateView { buildColumns = BuildColumn.format(order) }
     }
 
-    private fun columnsMenu() = ViewOptions.menu("jobs.show", listOf(
-        object : com.intellij.openapi.project.DumbAwareToggleAction(JenkSpotterBundle.message("builds.show.allRunning")) {
-            override fun isSelected(e: AnActionEvent) = JenkSpotterSettings.getInstance().current.showAllRunning
-            override fun setSelected(e: AnActionEvent, state: Boolean) {
-                JenkSpotterSettings.getInstance().updateView { showAllRunning = state }
-                BuildMonitorService.getInstance().refresh()
+    /**
+     * Builds of other people: none (only those of interest), the running ones, or the running ones
+     * plus the last N finished builds of all jobs.
+     */
+    private fun allBuildsMenu() = DefaultActionGroup({ JenkSpotterBundle.message("builds.show.all") }, true).apply {
+        fun choice(text: String, running: Boolean, history: Int) =
+            object : com.intellij.openapi.project.DumbAwareToggleAction(text) {
+                override fun isSelected(e: AnActionEvent): Boolean {
+                    val view = JenkSpotterSettings.getInstance().current
+                    return view.showAllRunning == running && (!running || view.allBuildsHistory == history)
+                }
+                override fun setSelected(e: AnActionEvent, state: Boolean) {
+                    JenkSpotterSettings.getInstance().updateView { showAllRunning = running; allBuildsHistory = history }
+                    BuildMonitorService.getInstance().refresh()
+                }
+                override fun update(e: AnActionEvent) {
+                    super.update(e)
+                    e.presentation.description = JenkSpotterBundle.message("builds.show.allRunning.description")
+                }
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
             }
-            override fun update(e: AnActionEvent) {
-                super.update(e)
-                e.presentation.description = JenkSpotterBundle.message("builds.show.allRunning.description")
-            }
-            override fun getActionUpdateThread() = ActionUpdateThread.EDT
-        },
+        add(choice(JenkSpotterBundle.message("builds.show.all.off"), running = false, history = 0))
+        add(choice(JenkSpotterBundle.message("builds.show.all.running"), running = true, history = 0))
+        for (n in HISTORY_SIZES) add(choice(JenkSpotterBundle.message("builds.show.all.history", n), running = true, history = n))
+    }
+
+    private fun columnsMenu() = ViewOptions.menu("builds.show", listOf(
+        allBuildsMenu(),
         ViewOptions.toggle("builds.show.folders", { showBuildJobFolders }) { showBuildJobFolders = it },
         com.intellij.openapi.actionSystem.Separator.create(JenkSpotterBundle.message("builds.columns")),
     ) + BuildColumn.entries.map { column ->
@@ -622,6 +868,8 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         }
 
         override fun paintComponent(g: java.awt.Graphics) {
+            // After the cell itself: on striped and selected rows it fills its background.
+            super.paintComponent(g)
             if (fraction >= 0) {
                 val h = JBUI.scale(3)
                 g.color = com.intellij.ui.JBColor.border()
@@ -629,7 +877,6 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
                 g.color = com.intellij.ui.JBColor(0x3574F0, 0x548AF7)
                 g.fillRect(JBUI.scale(4), height - h - JBUI.scale(1), ((width - JBUI.scale(8)) * fraction).toInt(), h)
             }
-            super.paintComponent(g)
         }
     }
 
@@ -662,11 +909,10 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
                     ipad = JBUI.emptyInsets()
                     append(jobLabel(item.serverId, item.tracked.build.jobFullName), plain)
                     append("  #${item.tracked.build.number}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    toolTipText = buildTooltip(item.tracked)
                 }
             }
             val view = JenkSpotterSettings.getInstance().current
-            if (view.servers.size > 1 && filter.serverId == null && BuildColumn.SERVER !in BuildColumn.parse(view.buildColumns)) {
+            if (view.servers.size > 1 && filter.serverId == null && BuildColumn.SERVER !in shownColumns.orEmpty()) {
                 val server = JenkSpotterSettings.getInstance().server(item.serverId)?.displayName.orEmpty()
                 append("  $server", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
             }
@@ -696,6 +942,7 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         }
         if (!JenkSpotterSettings.getInstance().current.showBuildJobFolders) out.append("<br>").append(e(JenkinsPaths.displayName(b.jobFullName)))
         out.append("<br>").append(JenkSpotterBundle.message("builds.tooltip.started", DateFormatUtil.formatDateTime(b.timestamp)))
+        failureHint(tracked)?.let(out::append)
         b.causeDescriptions.distinct().forEach { out.append("<br>").append(e(it)) }
         b.tests?.let { t ->
             out.append("<br>").append(if (t.failed > 0) JenkSpotterBundle.message("tests.failed", t.failed, t.total) else JenkSpotterBundle.message("tests.passed", t.total))
@@ -708,14 +955,36 @@ class BuildsPanel(private val project: Project, private val filter: SharedFilter
         return out.append("</html>").toString()
     }
 
+    /**
+     * The reason of a failed build arrived while its tooltip may be showing "looking...": a mouse
+     * move at the same place makes the tooltip ask for its text again.
+     */
+    private fun refreshTooltip(at: java.awt.Point) {
+        val mouse = table.mousePosition ?: return
+        if (table.rowAtPoint(mouse) != table.rowAtPoint(at)) return
+        java.awt.Toolkit.getDefaultToolkit().systemEventQueue.postEvent(
+            MouseEvent(table, MouseEvent.MOUSE_MOVED, System.currentTimeMillis(), 0, mouse.x, mouse.y, 0, false),
+        )
+    }
+
+    /** Failed stage and error lines of a failed build, once loaded; see [de.pdenis.jenkspotter.core.FailureHints]. */
+    private fun failureHint(build: TrackedBuild): String? =
+        FailureHintHtml.render(de.pdenis.jenkspotter.core.FailureHints.getInstance().peek(build))
+
     companion object {
-        /** Which entry of the status filter a build belongs to. */
-        fun statusOf(build: de.pdenis.jenkspotter.api.BuildInfo): BuildStatusFilter = when {
-            build.building -> BuildStatusFilter.RUNNING
-            build.result == BuildResult.SUCCESS -> BuildStatusFilter.SUCCESS
-            build.result == BuildResult.FAILURE -> BuildStatusFilter.FAILURE
-            build.result == BuildResult.UNSTABLE -> BuildStatusFilter.UNSTABLE
-            else -> BuildStatusFilter.ABORTED
+        private val PAGE_SIZES = listOf(25, 50, 100, 200)
+        private val HISTORY_SIZES = listOf(25, 50, 100, 200)
+        private const val SORT_JOB = "JOB"
+        private val CHIP_STATES = listOf(ChipState.INCLUDE, ChipState.EXCLUDE, ChipState.OFF)
+        private const val HOVER_DELAY_MILLIS = 400
+
+        /** Which status chip a build belongs to. */
+        fun statusOf(build: de.pdenis.jenkspotter.api.BuildInfo): BuildChip = when {
+            build.building -> BuildChip.RUNNING
+            build.result == BuildResult.SUCCESS -> BuildChip.SUCCESS
+            build.result == BuildResult.FAILURE -> BuildChip.FAILURE
+            build.result == BuildResult.UNSTABLE -> BuildChip.UNSTABLE
+            else -> BuildChip.ABORTED
         }
 
         private fun jobName(row: BuildRow) = when (row) {
