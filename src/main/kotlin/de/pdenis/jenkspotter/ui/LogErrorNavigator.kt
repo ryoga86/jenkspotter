@@ -44,9 +44,18 @@ class LogErrorNavigator(private val console: ConsoleView) {
         scanned = null
     }
 
-    /** Marks the error lines printed since the last call; a line still being written waits for its end. */
+    /**
+     * Marks the error lines printed since the last call, once the console has written them to its
+     * document; a line still being written waits for its end.
+     */
     fun scan() {
-        (console as? ConsoleViewImpl)?.flushDeferredText()
+        // Not flushDeferredText(): right after clear() it drops the new text, because the queued
+        // clear runs after the flush. That left the stage log empty.
+        val impl = console as? ConsoleViewImpl
+        if (impl != null) impl.performWhenNoDeferredOutput(::scanDocument) else scanDocument()
+    }
+
+    private fun scanDocument() {
         val editor = editor ?: return
         (editor.markupModel as? EditorMarkupModel)?.isErrorStripeVisible = true
         val document = editor.document
@@ -72,7 +81,7 @@ class LogErrorNavigator(private val console: ConsoleView) {
 
     /** Moves the caret to the next (or previous) error line after the caret, wrapping around. */
     fun jump(forward: Boolean) {
-        scan()
+        scanDocument()
         val editor = editor ?: return
         val starts = highlighters.filter { it.isValid }.map { it.startOffset }.sorted()
         if (starts.isEmpty()) return
