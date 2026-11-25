@@ -1,55 +1,24 @@
 #!/usr/bin/env python3
 """Builds the JenkSpotter icons.
 
-pluginIcon*.svg is derived from the official Jenkins logo (art/jenkins-original.svg, by Charles
-Lowell and Frontside, CC BY-SA 3.0, https://jenkins.io/): the background is recoloured (so the
-icon is not mistaken for the official Jenkins logo) and the butler peers through a magnifying
-glass. The small 16px status icons are simplified drawings of the same head because the original
-detail does not survive at that size; the colour of the bow tie carries the status.
+META-INF/pluginIcon.svg (and the _dark copy) is the round plugin icon art/plugin-marketplace.svg, copied as it is:
+its white ring keeps it readable on light and dark backgrounds, so both themes use the same file.
+The small 16px status and tool window icons are simplified butler heads drawn here; the colour of the bow tie
+carries the status.
 
 Run from the repository root: python3 tools/generate_icons.py
 """
-import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ORIGINAL = ROOT / "art" / "jenkins-original.svg"
+PLUGIN_ICON = ROOT / "art" / "plugin-marketplace.svg"
 OUT = ROOT / "src" / "main" / "resources"
 
 BRAND = "#1f8a8a"
 
-RECOLOR = {
-    "path22": ("#d33833", BRAND),  # background circle
-    "path24": ("#ef3d3a", "#27a3a3"),  # circle highlight
-}
-
-
-def magnifier(cx: float, cy: float, r: float, hx: float, hy: float) -> str:
-    """Lens at (cx, cy) with radius r, handle ending at (hx, hy); in the logo's own coordinate
-    system (y axis points up, see the group transform)."""
-    return f"""
-<g id="magnifier">
-  <path d="M {cx + r * 0.62:g},{cy - r * 0.62:g} L {hx:g},{hy:g}" stroke="#1d1919" stroke-width="{r * 0.62:g}" stroke-linecap="round"/>
-  <path d="M {cx + r * 0.70:g},{cy - r * 0.70:g} L {hx:g},{hy:g}" stroke="#5a3a22" stroke-width="{r * 0.38:g}" stroke-linecap="round"/>
-  <circle cx="{cx:g}" cy="{cy:g}" r="{r:g}" fill="#ffffff" fill-opacity="0.28" stroke="#1d1919" stroke-width="{r * 0.42:g}"/>
-  <circle cx="{cx:g}" cy="{cy:g}" r="{r:g}" fill="none" stroke="#c9ced6" stroke-width="{r * 0.2:g}"/>
-  <path d="M {cx - r * 0.55:g},{cy + r * 0.15:g} A {r * 0.6:g},{r * 0.6:g} 0 0 1 {cx - r * 0.1:g},{cy + r * 0.58:g}" fill="none"
-        stroke="#ffffff" stroke-opacity="0.85" stroke-width="{r * 0.14:g}" stroke-linecap="round"/>
-</g>
-"""
-
 
 def plugin_icon() -> str:
-    svg = ORIGINAL.read_text()
-    svg = re.sub(r"<metadata.*?</metadata>", "", svg, flags=re.S)
-    svg = re.sub(r"<sodipodi:namedview.*?/>", "", svg, flags=re.S)
-    svg = re.sub(r'\s(?:inkscape|sodipodi):[a-z-]+="[^"]*"', "", svg)
-    for pid, (old, new) in RECOLOR.items():
-        svg = re.sub(rf'(style="[^"]*){old}([^"]*"\s*id="{pid}")', rf"\g<1>{new}\g<2>", svg, flags=re.I)
-    # Lens in front of the butler's left eye (right in the picture), handle down to the right.
-    svg = svg.replace("</g></g></svg>", magnifier(141, 192, 23, 182, 146) + "</g></g></svg>")
-    svg = re.sub(r'width="226"\s*height="312"', 'width="40" height="40" viewBox="9 -26 213 213"', svg)
-    return svg
+    return PLUGIN_ICON.read_text()
 
 
 def head(tie: str, dark: bool, faded: bool = False) -> str:

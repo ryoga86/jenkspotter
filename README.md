@@ -4,6 +4,8 @@
 
 Keeps an eye on your Jenkins builds while you keep working – in IntelliJ IDEA and all other IntelliJ-based IDEs.
 
+![JenkSpotter - Watching your builds, so you don't have to.](art/JenkSpotter-banner-marketplace.png)
+
 JenkSpotter watches the builds you care about, tells you when they finish or wait for your approval, and lets you
 start, rebuild, abort and read them without leaving the IDE. It is built for big Jenkins installations: hundreds of
 jobs in folders and multibranch pipelines, several servers, and a lot of builds that are none of your business.
@@ -117,7 +119,7 @@ the tests use; its password and API token are in `docker/.env`. Remove everythin
 | `src/main/kotlin/…/notify` | notifications and sounds |
 | `docker/` | local test Jenkins |
 | `tools/` | generators for the icons (`generate_icons.py`) and sounds (`generate_sounds.py`) |
-| `art/` | the original Jenkins logo the plugin icons are derived from |
+| `art/` | plugin icon (`plugin-marketplace.svg`, round), the same without ring (`pluginIcon.svg`) and the banner |
 
 The plugin is compiled against 2025.2; the oldest supported line (2025.1) is covered by the plugin verifier. Releases
 are described in [RELEASING.md](RELEASING.md).
@@ -132,8 +134,7 @@ Bugs and ideas: [GitHub issues](https://github.com/ryoga86/jenkspotter/issues)
 
 ## License
 
-[MIT](LICENSE) for the code. The plugin icons are derived from the Jenkins logo and licensed under
-[CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/), see [NOTICE](NOTICE). The sounds are synthesized by
+[MIT](LICENSE) for the code, see [NOTICE](NOTICE) for the rest. The sounds are synthesized by
 `tools/generate_sounds.py`.
 
 JenkSpotter is not affiliated with or endorsed by the Jenkins project. Jenkins® is a registered trademark of
