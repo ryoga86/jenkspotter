@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-25
+
 First public release.
 
 ### Added
@@ -45,3 +47,6 @@ First public release.
   lists, credentials and run parameters. Values are remembered per job, Rebuild reuses the previous ones
 - Adaptive, network friendly polling (gzip, compact requests, intervals follow the build's estimated duration); the
   job index is read in the background, so the jobs list stays fluent with thousands of jobs
+
+[Unreleased]: https://github.com/ryoga86/jenkspotter/compare/1.0.0...HEAD
+[1.0.0]: https://github.com/ryoga86/jenkspotter/commits/1.0.0
