@@ -1,10 +1,10 @@
-![JenkSpotter - Watching your builds, so you don't have to.](art/JenkSpotter-banner-marketplace.png)
-
 # JenkSpotter
 
 [![Build](https://github.com/ryoga86/jenkspotter/actions/workflows/build.yml/badge.svg)](https://github.com/ryoga86/jenkspotter/actions/workflows/build.yml)
 
 Keeps an eye on your Jenkins builds while you keep working – in IntelliJ IDEA and all other IntelliJ-based IDEs.
+
+![JenkSpotter - Watching your builds, so you don't have to.](art/JenkSpotter-banner-marketplace.png)
 
 JenkSpotter watches the builds you care about, tells you when they finish or wait for your approval, and lets you
 start, rebuild, abort and read them without leaving the IDE. It is built for big Jenkins installations: hundreds of
