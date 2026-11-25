@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The Stages tab showed an empty log for the selected stage (on IntelliJ 2025.2 and possibly other versions); the
+  log is shown again and its error lines are highlighted
+
 ## [1.0.0] - 2026-11-24
 
 First public release.
