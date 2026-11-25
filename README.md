@@ -119,7 +119,7 @@ the tests use; its password and API token are in `docker/.env`. Remove everythin
 | `src/main/kotlin/…/notify` | notifications and sounds |
 | `docker/` | local test Jenkins |
 | `tools/` | generators for the icons (`generate_icons.py`) and sounds (`generate_sounds.py`) |
-| `art/` | plugin icon (`pluginIcon.svg`), Marketplace thumbnail and banner |
+| `art/` | plugin icon (`plugin-marketplace.svg`, round), the same without ring (`pluginIcon.svg`) and the banner |
 
 The plugin is compiled against 2025.2; the oldest supported line (2025.1) is covered by the plugin verifier. Releases
 are described in [RELEASING.md](RELEASING.md).

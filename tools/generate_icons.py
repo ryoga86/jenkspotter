@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Builds the JenkSpotter icons.
 
-META-INF/pluginIcon.svg (and the _dark copy) is the plugin icon drawn in art/pluginIcon.svg, copied as it is.
+META-INF/pluginIcon.svg (and the _dark copy) is the round plugin icon art/plugin-marketplace.svg, copied as it is:
+its white ring keeps it readable on light and dark backgrounds, so both themes use the same file.
 The small 16px status and tool window icons are simplified butler heads drawn here; the colour of the bow tie
 carries the status.
 
@@ -10,7 +11,7 @@ Run from the repository root: python3 tools/generate_icons.py
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PLUGIN_ICON = ROOT / "art" / "pluginIcon.svg"
+PLUGIN_ICON = ROOT / "art" / "plugin-marketplace.svg"
 OUT = ROOT / "src" / "main" / "resources"
 
 BRAND = "#1f8a8a"
