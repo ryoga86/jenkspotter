@@ -125,8 +125,9 @@ git commit -am "Release x.y.z" && git tag x.y.z && git push && git push --tags
   lose their settings, API tokens, own shortcuts or notification settings.
 - **Signing key** (`private_encrypted.pem`, `chain.crt`, `password.txt`): shared with RepoLeap, backed up in the
   password manager, never committed.
-- **Artwork:** `art/pluginIcon.svg` is the plugin icon (`tools/generate_icons.py` copies it to `META-INF` and
-  draws the 16px icons), `art/plugin-marketplace.svg` is the round thumbnail for the Marketplace page. The banner
+- **Artwork:** `art/plugin-marketplace.svg` is the round plugin icon (`tools/generate_icons.py` copies it to
+  `META-INF/pluginIcon.svg` and `pluginIcon_dark.svg`, the Marketplace and the IDE show that one, and draws the 16px
+  icons), `art/pluginIcon.svg` is the same butler without the ring. The banner
   `art/JenkSpotter-banner-marketplace.png` is shown in the README and loaded live from `main` by the plugin
   description (`raw.githubusercontent.com/ryoga86/jenkspotter/main/art/…`): do not rename or delete it while a
   published version uses it, and keep the repository public.
