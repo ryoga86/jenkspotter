@@ -1,5 +1,7 @@
 # JenkSpotter
 
+[![Version](https://img.shields.io/jetbrains/plugin/v/36446)](https://plugins.jetbrains.com/plugin/36446-jenkspotter)
+[![Downloads](https://img.shields.io/jetbrains/plugin/d/36446)](https://plugins.jetbrains.com/plugin/36446-jenkspotter)
 [![Build](https://github.com/ryoga86/jenkspotter/actions/workflows/build.yml/badge.svg)](https://github.com/ryoga86/jenkspotter/actions/workflows/build.yml)
 
 Keeps an eye on your Jenkins builds while you keep working – in IntelliJ IDEA and all other IntelliJ-based IDEs.
